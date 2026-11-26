@@ -782,9 +782,20 @@ fn coherent_file() -> std::path::PathBuf {
     crate::state::data_dir().join("cache").join("uma_coherent.txt")
 }
 
+/// Optional upper cap on the coherent window(s) in bytes (`XCL_COHERENT_CAP_MB`), keeping
+/// `uma_coherent.txt` auto-growth bounded so large general-purpose title heaps stay out of
+/// GPU-writable Window 3 when desired.
+fn coherent_cap_bytes(max_cap: usize) -> usize {
+    std::env::var("XCL_COHERENT_CAP_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| (mb << 20).clamp(GRAIN, max_cap))
+        .unwrap_or(max_cap)
+}
+
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
 pub fn coherent_hint_for(windows: usize) -> usize {
-    let cap = max_coherent_bytes(windows);
+    let cap = coherent_cap_bytes(max_coherent_bytes(windows));
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return (mb << 20).clamp(GRAIN, cap);
     }
