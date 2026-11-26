@@ -581,6 +581,38 @@ fn keep_spare_pools() -> usize {
     })
 }
 
+/// Default Windows virtual commit reserve floor (4 GiB) below which optional VRAM pool spares
+/// and large upload staging batches shed commit headroom.
+const DEFAULT_COMMIT_RESERVE_MIB: u64 = 4096;
+
+/// `XCL_COMMIT_RESERVE_MB` (default `4096`, `0` disables): free Windows commit floor in bytes.
+fn commit_reserve_bytes() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let mib = std::env::var("XCL_COMMIT_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_COMMIT_RESERVE_MIB);
+        mib.saturating_mul(1024 * 1024)
+    })
+}
+
+fn avail_commit_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
+
+fn commit_below_floor(avail_bytes: Option<u64>, floor_bytes: u64) -> bool {
+    floor_bytes > 0 && avail_bytes.is_some_and(|avail| avail < floor_bytes)
+}
+
+/// True when Windows available virtual commit (`ullAvailPageFile`) is below the reserve floor.
+pub(super) fn commit_low() -> bool {
+    commit_below_floor(avail_commit_bytes(), commit_reserve_bytes())
+}
+
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
@@ -658,10 +690,11 @@ impl Pages {
     /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
     /// pool heaps (above the warm spare count), returning their `ID3D12Heap`s to be dropped
     /// outside `PAGES.lock()`.
-    fn sweep_and_reclaim(&mut self, now: std::time::Instant) -> Vec<ID3D12Heap> {
+    fn sweep_and_reclaim(&mut self, now: std::time::Instant, low_commit: bool) -> Vec<ID3D12Heap> {
         self.sweep(now);
         self.pool.drain_cooling(now);
-        let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
+        let keep_spare = if low_commit { 0 } else { keep_spare_pools() };
+        let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare, POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
             if let Some(h) = self.pools.take_heap(idx) {
@@ -1248,10 +1281,12 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
                 pages.waited.insert(key, pages.value);
             }
-            if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
+            let low_commit = commit_low();
+            let reclaim_interval = if low_commit { std::time::Duration::from_millis(250) } else { std::time::Duration::from_secs(1) };
+            if now.duration_since(pages.last_reclaim) >= reclaim_interval {
                 pages.last_reclaim = now;
                 do_reclaim = true;
-                newly_reclaimed = pages.sweep_and_reclaim(now);
+                newly_reclaimed = pages.sweep_and_reclaim(now, low_commit);
                 if !newly_reclaimed.is_empty() {
                     unmap_mark = Some((pages.fence.clone(), pages.value));
                 }
@@ -2217,5 +2252,15 @@ mod tests {
             );
             assert!(new_calls < old_calls);
         }
+    }
+
+    #[test]
+    fn commit_below_floor_enforces_reserve_and_zero_disables() {
+        const FLOOR: u64 = 4 * 1024 * 1024 * 1024;
+        assert!(commit_below_floor(Some(FLOOR - 1), FLOOR));
+        assert!(!commit_below_floor(Some(FLOOR), FLOOR));
+        assert!(!commit_below_floor(Some(FLOOR + 1), FLOOR));
+        assert!(!commit_below_floor(None, FLOOR));
+        assert!(!commit_below_floor(Some(0), 0));
     }
 }

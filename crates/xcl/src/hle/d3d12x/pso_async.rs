@@ -317,12 +317,89 @@ fn enqueue(p: Arc<Pending>) {
     let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&p)));
 }
 
+/// Commit-headroom thresholds (`GlobalMemoryStatusEx::ullAvailPageFile`) for throttling background
+/// PSO compilation under memory pressure (`XCL_PSO_MEM_THROTTLE=0`: off).
+const PRELOAD_PAUSE_COMMIT: u64 = 4 << 30;
+const WORKER_CAP_2_COMMIT: u64 = 4 << 30;
+const WORKER_CAP_1_COMMIT: u64 = 2 << 30;
+
+fn mem_throttle_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !cfg!(test) && !std::env::var("XCL_PSO_MEM_THROTTLE").is_ok_and(|v| v.trim() == "0"))
+}
+
+fn avail_commit_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
+
+/// Maximum concurrent top-level PSO worker builds allowed for the current available commit bytes:
+/// `< 2 GiB` -> 1 worker (never 0, no deadlock), `< 4 GiB` -> at most 2, otherwise `max_workers`.
+fn worker_cap_for_commit(avail_commit: Option<u64>, max_workers: usize) -> usize {
+    let max_workers = max_workers.max(1);
+    match avail_commit {
+        Some(avail) if avail < WORKER_CAP_1_COMMIT => 1,
+        Some(avail) if avail < WORKER_CAP_2_COMMIT => max_workers.min(2),
+        _ => max_workers,
+    }
+}
+
+/// Pause speculative `xcl-pso-pre-*` preload builds while available commit is below 4 GiB.
+fn should_pause_preload(avail_commit: Option<u64>) -> bool {
+    avail_commit.is_some_and(|avail| avail < PRELOAD_PAUSE_COMMIT)
+}
+
+struct ActiveWorkerGate {
+    active: Mutex<usize>,
+    cv: Condvar,
+}
+
+static ACTIVE_WORKERS: ActiveWorkerGate = ActiveWorkerGate {
+    active: Mutex::new(0),
+    cv: Condvar::new(),
+};
+
+struct ActiveWorkerGuard;
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        let mut n = ACTIVE_WORKERS.active.lock().unwrap();
+        *n = n.saturating_sub(1);
+        ACTIVE_WORKERS.cv.notify_all();
+    }
+}
+
+fn acquire_worker_slot(max_workers: usize) -> ActiveWorkerGuard {
+    let mut n = ACTIVE_WORKERS.active.lock().unwrap();
+    loop {
+        let avail = mem_throttle_enabled().then(avail_commit_bytes).flatten();
+        let cap = worker_cap_for_commit(avail, max_workers);
+        if *n < cap {
+            if cap < max_workers {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    crate::xlog_info!(
+                        "D3D12.X: throttling PSO workers to {cap} under low commit headroom ({} MiB free)",
+                        avail.unwrap_or(0) >> 20
+                    );
+                });
+            }
+            *n += 1;
+            return ActiveWorkerGuard;
+        }
+        n = ACTIVE_WORKERS.cv.wait_timeout(n, std::time::Duration::from_millis(50)).unwrap().0;
+    }
+}
+
 fn build_queued(p: &Arc<Pending>) {
     // (released by the title meanwhile)
     if p.orphan.load(Ordering::Acquire) {
         drop_unstarted_job(p);
         return;
     }
+    let _slot = acquire_worker_slot(crate::gpu::recomp::dxc::compile_threads());
     // (None: a bind took it and builds it itself)
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
@@ -526,6 +603,9 @@ fn preload() -> Option<&'static Preload> {
                 }
                 static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
+                    while mem_throttle_enabled() && should_pause_preload(avail_commit_bytes()) {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
                     let p = {
                         let mut g = q.list.lock().unwrap();
                         loop {
@@ -1232,4 +1312,26 @@ pub fn need_by_submit(pso: usize) {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod commit_throttle_tests {
+    use super::*;
+
+    #[test]
+    fn commit_headroom_throttles_workers_and_pauses_preload() {
+        assert_eq!(worker_cap_for_commit(None, 8), 8);
+        assert_eq!(worker_cap_for_commit(Some(6 << 30), 8), 8);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT), 8), 8);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT - 1), 8), 2);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT), 8), 2);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT - 1), 8), 1);
+        assert_eq!(worker_cap_for_commit(Some(0), 8), 1, "must never drop to 0 workers");
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT - 1), 1), 1);
+
+        assert!(!should_pause_preload(None));
+        assert!(!should_pause_preload(Some(PRELOAD_PAUSE_COMMIT)));
+        assert!(should_pause_preload(Some(PRELOAD_PAUSE_COMMIT - 1)));
+        assert!(should_pause_preload(Some(0)));
+    }
 }

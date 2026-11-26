@@ -1075,19 +1075,29 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
 /// and keeps each GPU copy list short enough to avoid WDDM 2 s TDR when thousands of small
 /// textures stream at once.
 const BATCH_BYTES: usize = 32 << 20;
+/// Tighter batch cap under low Windows commit headroom (`vram::commit_low`) so persistent texture
+/// upload staging buffers stay small instead of growing to 64–144 MiB.
+const BATCH_BYTES_LOW_COMMIT: usize = 8 << 20;
 const BATCH_ITEMS: usize = 256;
 
 /// Whether another upload `(next_dev, next_bytes)` still fits in the current batch of
-/// `picked_count` textures totalling `picked_bytes` on `batch_dev`. An empty batch always takes
-/// its first upload (even if larger than `BATCH_BYTES`) so progress is guaranteed.
-fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize) -> bool {
+/// `picked_count` textures totalling `picked_bytes` on `batch_dev` under byte cap `max_bytes`.
+/// An empty batch always takes its first upload (even if larger than `max_bytes`) so progress is
+/// guaranteed.
+fn batch_fits_limit(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize, max_bytes: usize) -> bool {
     picked_count == 0
         || (picked_count < BATCH_ITEMS
             && next_dev == batch_dev
-            && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
+            && picked_bytes.saturating_add(next_bytes) <= max_bytes)
 }
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
+#[cfg(test)]
+fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize) -> bool {
+    batch_fits_limit(picked_count, picked_bytes, batch_dev, next_dev, next_bytes, BATCH_BYTES)
+}
+
+/// The uploads `todo`, in batches of up to `BATCH_BYTES` (or `BATCH_BYTES_LOW_COMMIT` when Windows
+/// commit is below reserve) and `BATCH_ITEMS` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
@@ -1100,8 +1110,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
+        let max_batch_bytes = if super::vram::commit_low() { BATCH_BYTES_LOW_COMMIT } else { BATCH_BYTES };
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
+            if !batch_fits_limit(picked.len(), bytes, device, *dev, tex.size() as usize, max_batch_bytes) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();

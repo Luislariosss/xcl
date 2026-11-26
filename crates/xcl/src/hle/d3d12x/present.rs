@@ -124,6 +124,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
     super::real::stop_if_device_removed();
+    crate::gpu::texture::trim_idle_staging(frames, super::vram::commit_low());
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
