@@ -84,10 +84,12 @@ pub(super) fn unmark(page: usize) -> bool {
 }
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
+/// Also brings back any CPU-parked sparse-window tiles in `[p, p + len)` from VRAM.
 pub fn ensure(p: usize, len: usize) {
     if len == 0 {
         return;
     }
+    unsafe { crate::hle::d3d12x::sparse::ensure_cpu_resident(p, len) };
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {

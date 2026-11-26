@@ -16,19 +16,22 @@
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, Once, OnceLock, RwLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
 use windows_sys::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, PAGE_GUARD,
-    PAGE_NOACCESS, PAGE_READWRITE,
+    GetWriteWatch, ResetWriteWatch, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION,
+    MEM_COMMIT, MEM_DECOMMIT, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
 const TILE: usize = 0x1_0000;
@@ -91,11 +94,181 @@ struct TileEntry {
     holes: u16,
     /// per-4 KiB-page hashes of the 64-byte chunks last sent to the GPU (`None` = all zero)
     sent: [Option<Box<[u64; CHUNKS]>>; PAGES_PER_TILE],
+    /// true when the CPU copy of this tile's non-hole pages was decommitted to save RAM
+    /// (the authoritative data lives in the GPU tile and is read back on touch)
+    cpu_parked: bool,
+    /// last time the CPU wrote, committed, or unparked this tile
+    last_cpu_activity: std::time::Instant,
+    /// `State::value` of the last upload or zero-clear that touched this tile
+    last_upload_fence: u64,
 }
 
 impl TileEntry {
     fn with_holes(pool: (u32, u32), holes: u16) -> Self {
-        Self { pool, holes, sent: std::array::from_fn(|_| None) }
+        Self {
+            pool,
+            holes,
+            sent: std::array::from_fn(|_| None),
+            cpu_parked: false,
+            last_cpu_activity: std::time::Instant::now(),
+            last_upload_fence: 0,
+        }
+    }
+}
+
+/// Default idle duration (seconds) before a clean, GPU-resident sparse tile drops its CPU copy.
+/// Overridable via `XCL_SPARSE_PARK_SECS` (`0` disables CPU tile parking).
+const DEFAULT_CPU_PARK_SECS: u64 = 30;
+/// Maximum adaptive idle duration when re-faults indicate thrashing.
+const MAX_CPU_PARK_SECS: u64 = 300;
+/// Minimum interval between background parking sweeps inside `before_execute`.
+const CPU_PARK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Maximum number of tiles parked in one sweep (512 tiles = 32 MiB) to bound per-submit latency.
+const CPU_PARK_BATCH: usize = 512;
+/// Re-faults per second above which the adaptive idle threshold doubles (or pauses).
+const CPU_PARK_FAULT_RATE_LIMIT: u32 = 64;
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+/// Tile bases (64 KiB aligned) currently CPU-parked or in the middle of the park handshake.
+static CPU_PARKED: RwLock<BTreeSet<usize>> = RwLock::new(BTreeSet::new());
+/// Fast-path count of `CPU_PARKED` (zero check without taking any lock).
+static CPU_PARKED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// True while the current thread holds `STATE` (prevents recursive locking from the VEH).
+    static IN_STATE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn cpu_park_base_secs() -> u64 {
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        std::env::var("XCL_SPARSE_PARK_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CPU_PARK_SECS)
+    })
+}
+
+fn cpu_park_insert(tile: usize) {
+    let mut g = CPU_PARKED.write().unwrap_or_else(|e| e.into_inner());
+    if g.insert(tile) {
+        CPU_PARKED_COUNT.store(g.len(), Ordering::Release);
+    }
+}
+
+fn cpu_park_remove(tile: usize) {
+    let mut g = CPU_PARKED.write().unwrap_or_else(|e| e.into_inner());
+    if g.remove(&tile) {
+        CPU_PARKED_COUNT.store(g.len(), Ordering::Release);
+    }
+}
+
+fn cpu_park_clear() {
+    let mut g = CPU_PARKED.write().unwrap_or_else(|e| e.into_inner());
+    g.clear();
+    CPU_PARKED_COUNT.store(0, Ordering::Release);
+}
+
+/// Iterate contiguous committed (non-hole) 4 KiB page runs in a 64 KiB tile.
+fn for_each_non_hole_run(tile: usize, holes: u16, mut f: impl FnMut(usize, usize) -> bool) -> bool {
+    let mut idx = 0usize;
+    while idx < PAGES_PER_TILE {
+        if holes & (1u16 << idx) != 0 {
+            idx += 1;
+            continue;
+        }
+        let start = idx;
+        while idx < PAGES_PER_TILE && holes & (1u16 << idx) == 0 {
+            idx += 1;
+        }
+        if !f(tile + start * PAGE, (idx - start) * PAGE) {
+            return false;
+        }
+    }
+    true
+}
+
+unsafe fn protect_non_holes(tile: usize, holes: u16, prot: u32) -> bool {
+    for_each_non_hole_run(tile, holes, |addr, len| {
+        let mut old = 0u32;
+        VirtualProtect(addr as *const c_void, len, prot, &mut old) != 0
+    })
+}
+
+unsafe fn commit_non_holes(tile: usize, holes: u16) -> bool {
+    for_each_non_hole_run(tile, holes, |addr, len| {
+        !VirtualAlloc(addr as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null()
+    })
+}
+
+unsafe fn decommit_non_holes(tile: usize, holes: u16) {
+    for_each_non_hole_run(tile, holes, |addr, len| {
+        VirtualFree(addr as *mut c_void, len, MEM_DECOMMIT);
+        true
+    });
+}
+
+fn install_cpu_park_veh() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(cpu_park_veh));
+    });
+}
+
+unsafe extern "system" fn cpu_park_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if CPU_PARKED_COUNT.load(Ordering::Acquire) == 0 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let r = &*(*info).ExceptionRecord;
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let addr = r.ExceptionInformation[1];
+    let tile = addr & !(TILE - 1);
+    let in_set = CPU_PARKED.read().unwrap_or_else(|e| e.into_inner()).contains(&tile);
+    if !in_set {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if IN_STATE.with(|c| c.get()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let mut g = lock_state();
+    let Some(s) = g.as_mut() else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    if s.unpark_tile_locked(tile, true) {
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
+/// Ensure that any CPU-parked sparse-window tiles overlapping `[a, a + n)` are committed and
+/// copied back from VRAM before a kernel call or XCL routine reads/writes them.
+pub unsafe fn ensure_cpu_resident(a: usize, n: usize) {
+    if n == 0 || CPU_PARKED_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if IN_STATE.with(|c| c.get()) {
+        return;
+    }
+    let first = a & !(TILE - 1);
+    let end = a.saturating_add(n);
+    let tiles: Vec<usize> = {
+        let g = CPU_PARKED.read().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            return;
+        }
+        g.range(first..end).copied().collect()
+    };
+    if tiles.is_empty() {
+        return;
+    }
+    let mut g = lock_state();
+    let Some(s) = g.as_mut() else { return };
+    for t in tiles {
+        s.unpark_tile_locked(t, false);
     }
 }
 
@@ -264,6 +437,14 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// CPU-tile parking state (drop CPU copy of idle GPU-resident tiles, read back on touch)
+    last_park_sweep: std::time::Instant,
+    park_idle_secs: u64,
+    park_paused_until: Option<std::time::Instant>,
+    park_fault_window: std::time::Instant,
+    park_faults_in_window: u32,
+    cpu_parked_tiles: usize,
+    cpu_unpark_count: u64,
 }
 
 impl Drop for State {
@@ -575,6 +756,13 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            last_park_sweep: std::time::Instant::now(),
+            park_idle_secs: cpu_park_base_secs(),
+            park_paused_until: None,
+            park_fault_window: std::time::Instant::now(),
+            park_faults_in_window: 0,
+            cpu_parked_tiles: 0,
+            cpu_unpark_count: 0,
         })
     })();
     match made {
@@ -583,6 +771,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             // (the queue first: `queue()` never answers with one older than the state's)
+            cpu_park_clear();
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
@@ -1192,6 +1381,190 @@ impl State {
             self.submit_slot(slot_idx);
         }
     }
+
+    /// Wait for any in-flight title queues on `self.queue` so a subsequent VRAM readback sees
+    /// GPU writes from those queues.
+    unsafe fn order_queue_after_titles(&mut self) {
+        self.sync_known_queues();
+        let queues: Vec<ID3D12CommandQueue> = self.queue_fences.values().map(|(q, _, _)| q.clone()).collect();
+        for q in queues {
+            self.rb_value += 1;
+            let v = self.rb_value;
+            if q.Signal(&self.rb_fence, v).is_ok() {
+                let _ = self.queue.Wait(&self.rb_fence, v);
+                super::list_x::note_internal_wait(self.queue.as_raw() as usize, "sparse cpu-unpark behind a title queue", &self.rb_fence, v);
+            }
+        }
+    }
+
+    /// Restore a CPU-parked tile `t` from VRAM back into committed CPU pages.
+    /// Returns `true` if the tile is now CPU-accessible (either unparked here or already resident).
+    unsafe fn unpark_tile_locked(&mut self, t: usize, from_fault: bool) -> bool {
+        let Some((holes, was_parked)) = self.mapped.get(&t).map(|e| (e.holes, e.cpu_parked)) else {
+            cpu_park_remove(t);
+            return false;
+        };
+        if !was_parked {
+            // Either another thread already unparked it, or the park handshake aborted and restored RW.
+            cpu_park_remove(t);
+            return true;
+        }
+        if !commit_non_holes(t, holes) {
+            crate::xlog_warn!("sparse cpu-unpark: VirtualAlloc(MEM_COMMIT) failed for tile {t:#x}");
+            return false;
+        }
+        // Order our readback behind any title GPU work so CPU sees GPU writes made while parked.
+        self.order_queue_after_titles();
+        self.readback_ranges(&[(t, TILE)]);
+        // Clear write-watch bits caused by the readback memcpy so a pure read does not re-upload.
+        ResetWriteWatch(t as *const c_void, TILE);
+        let now = std::time::Instant::now();
+        if let Some(entry) = self.mapped.get_mut(&t) {
+            entry.cpu_parked = false;
+            entry.last_cpu_activity = now;
+            entry.last_upload_fence = self.value;
+        }
+        self.cpu_parked_tiles = self.cpu_parked_tiles.saturating_sub(1);
+        self.cpu_unpark_count += 1;
+        cpu_park_remove(t);
+
+        if from_fault {
+            if now.duration_since(self.park_fault_window) >= std::time::Duration::from_secs(1) {
+                self.park_fault_window = now;
+                self.park_faults_in_window = 1;
+            } else {
+                self.park_faults_in_window += 1;
+                if self.park_faults_in_window == CPU_PARK_FAULT_RATE_LIMIT {
+                    let prev = self.park_idle_secs;
+                    if prev < MAX_CPU_PARK_SECS {
+                        self.park_idle_secs = (prev * 2).min(MAX_CPU_PARK_SECS);
+                        crate::xlog_info!(
+                            "sparse cpu-park: high unpark rate ({}/s), raising idle threshold {}s -> {}s",
+                            self.park_faults_in_window,
+                            prev,
+                            self.park_idle_secs
+                        );
+                    } else {
+                        self.park_paused_until = Some(now + std::time::Duration::from_secs(30));
+                        crate::xlog_info!("sparse cpu-park: high unpark rate at max threshold, pausing parking for 30s");
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Restore every CPU-parked tile overlapping `[a, a + n)`.
+    unsafe fn unpark_range_locked(&mut self, a: usize, n: usize) {
+        if n == 0 || self.cpu_parked_tiles == 0 {
+            return;
+        }
+        let mut t = a & !(TILE - 1);
+        let end = a.saturating_add(n);
+        while t < end {
+            if self.mapped.get(&t).is_some_and(|e| e.cpu_parked) {
+                self.unpark_tile_locked(t, false);
+            }
+            match t.checked_add(TILE) {
+                Some(next) => t = next,
+                None => break,
+            }
+        }
+    }
+
+    /// Atomically park the CPU copy of one idle, GPU-resident tile `t`:
+    /// 1. Register `t` in `CPU_PARKED` and protect non-hole pages `PAGE_READONLY` so concurrent
+    ///    writers trap into the VEH and wait on `STATE`.
+    /// 2. Query `GetWriteWatch(0)` (without reset): if any page was dirtied since the last upload,
+    ///    restore `PAGE_READWRITE` and abort without losing writes.
+    /// 3. Otherwise, `MEM_DECOMMIT` the non-hole pages and drop `sent` hashes (~72 KiB RAM freed).
+    unsafe fn try_park_tile(&mut self, t: usize, now: std::time::Instant) -> bool {
+        let Some(holes) = self.mapped.get(&t).and_then(|e| (!e.cpu_parked && e.holes != 0xFFFF).then_some(e.holes)) else {
+            return false;
+        };
+        install_cpu_park_veh();
+        cpu_park_insert(t);
+        if !protect_non_holes(t, holes, PAGE_READONLY) {
+            let _ = protect_non_holes(t, holes, PAGE_READWRITE);
+            cpu_park_remove(t);
+            if let Some(e) = self.mapped.get_mut(&t) {
+                e.last_cpu_activity = now;
+            }
+            return false;
+        }
+        let mut addrs = [std::ptr::null_mut::<c_void>(); PAGES_PER_TILE];
+        let mut count = addrs.len();
+        let mut gran = 0u32;
+        let ww_ok = GetWriteWatch(0, t as *const c_void, TILE, addrs.as_mut_ptr(), &mut count, &mut gran) == 0;
+        if !ww_ok || count > 0 {
+            // A CPU write landed before VirtualProtect(PAGE_READONLY) took effect: abort safely.
+            let _ = protect_non_holes(t, holes, PAGE_READWRITE);
+            cpu_park_remove(t);
+            if let Some(e) = self.mapped.get_mut(&t) {
+                e.last_cpu_activity = now;
+            }
+            return false;
+        }
+        decommit_non_holes(t, holes);
+        if let Some(e) = self.mapped.get_mut(&t) {
+            e.cpu_parked = true;
+            e.sent = std::array::from_fn(|_| None);
+        }
+        self.cpu_parked_tiles += 1;
+        true
+    }
+
+    /// Park up to `max_tiles` eligible idle tiles whose last upload fence has completed.
+    unsafe fn sweep_cpu_park_now(&mut self, idle: std::time::Duration, max_tiles: usize) -> usize {
+        if max_tiles == 0 || self.mapped.is_empty() {
+            return 0;
+        }
+        let now = std::time::Instant::now();
+        let completed = self.fence.GetCompletedValue();
+        let mut candidates: Vec<usize> = Vec::new();
+        for (&t, e) in &self.mapped {
+            if e.cpu_parked || e.holes == 0xFFFF {
+                continue;
+            }
+            if completed < e.last_upload_fence {
+                continue;
+            }
+            if now.duration_since(e.last_cpu_activity) < idle {
+                continue;
+            }
+            if self.to_zero.iter().any(|&(za, zn)| za < t + TILE && za.saturating_add(zn) > t) {
+                continue;
+            }
+            candidates.push(t);
+            if candidates.len() >= max_tiles {
+                break;
+            }
+        }
+        let mut parked = 0usize;
+        for t in candidates {
+            if self.try_park_tile(t, now) {
+                parked += 1;
+            }
+        }
+        parked
+    }
+
+    /// Periodic background sweep called from `before_execute` (bounded latency per tick).
+    unsafe fn maybe_sweep_cpu_park(&mut self) {
+        if self.park_idle_secs == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.park_paused_until.is_some_and(|until| now < until) {
+            return;
+        }
+        if now.duration_since(self.last_park_sweep) < CPU_PARK_SWEEP_INTERVAL {
+            return;
+        }
+        self.last_park_sweep = now;
+        let idle = std::time::Duration::from_secs(self.park_idle_secs);
+        self.sweep_cpu_park_now(idle, CPU_PARK_BATCH);
+    }
 }
 
 /// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
@@ -1266,6 +1639,9 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
+    for &(a, n) in &merged {
+        s.unpark_range_locked(a, n);
+    }
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
@@ -1288,6 +1664,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if s.window_index(va).is_none() {
         return;
     }
+    s.unpark_range_locked(va, len);
     let zeroed = std::mem::take(&mut s.to_zero);
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
@@ -1355,13 +1732,16 @@ pub unsafe fn decommitted(a: usize, n: usize) {
 impl State {
     /// `committed` with the state locked
     unsafe fn commit_range(&mut self, a: usize, n: usize) {
+        self.unpark_range_locked(a, n);
         self.ensure_mapped(a, n, |_| 0xFFFF);
+        let now = std::time::Instant::now();
         let mut pg = a & !(PAGE - 1);
         let end = a.saturating_add(n);
         while pg < end {
             let t = pg & !(TILE - 1);
             let tile_end = t.saturating_add(TILE).min(end);
             if let Some(entry) = self.mapped.get_mut(&t) {
+                entry.last_cpu_activity = now;
                 let mut p = pg;
                 while p < tile_end {
                     entry.holes &= !(1u16 << ((p - t) / PAGE));
@@ -1378,12 +1758,12 @@ impl State {
     /// `decommitted` with the state locked: the tiles that go are parked (`flush_parked` unmaps
     /// them and frees their pool tiles)
     unsafe fn decommit_range(&mut self, a: usize, n: usize) {
-        let mut pools: Vec<(usize, (u32, u32))> = Vec::new();
+        let mut pools: Vec<(usize, (u32, u32), bool)> = Vec::new();
         let mut t = a & !(TILE - 1);
         let end = a.saturating_add(n);
         while t < end {
             if let Some(e) = self.mapped.get(&t) {
-                pools.push((t, e.pool));
+                pools.push((t, e.pool, e.cpu_parked));
             }
             match t.checked_add(TILE) {
                 Some(next) => t = next,
@@ -1397,6 +1777,10 @@ impl State {
         self.runs = None;
         for &t in &tiles {
             if let Ok(i) = pools.binary_search_by_key(&t, |p| p.0) {
+                if pools[i].2 {
+                    self.cpu_parked_tiles = self.cpu_parked_tiles.saturating_sub(1);
+                    cpu_park_remove(t);
+                }
                 self.parked.insert(t, pools[i].1);
             }
         }
@@ -1585,14 +1969,17 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             let t = x & !(TILE - 1);
             let end = (t + TILE).min(a + n);
             if let Some(entry) = s.mapped.get_mut(&t) {
-                let mut pg = x & !(PAGE - 1);
-                while pg < end {
-                    let idx = (pg - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
-                        scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                if !entry.cpu_parked {
+                    entry.last_cpu_activity = t_locked;
+                    let mut pg = x & !(PAGE - 1);
+                    while pg < end {
+                        let idx = (pg - t) / PAGE;
+                        if entry.holes & (1u16 << idx) == 0 {
+                            let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                            scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                        }
+                        pg += PAGE;
                     }
-                    pg += PAGE;
                 }
             }
             x = end;
@@ -1604,10 +1991,40 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     if !zero_runs.is_empty() {
         s.upload_zeros(&zero_runs);
+        let fv = s.value;
+        for &(za, zn) in &zero_runs {
+            let mut zt = za & !(TILE - 1);
+            let zend = za.saturating_add(zn);
+            while zt < zend {
+                if let Some(e) = s.mapped.get_mut(&zt) {
+                    e.last_upload_fence = fv;
+                    e.last_cpu_activity = t_locked;
+                }
+                match zt.checked_add(TILE) {
+                    Some(next) => zt = next,
+                    None => break,
+                }
+            }
+        }
     }
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
+        let fv = s.value;
+        for &(da, dn) in &dirty_runs {
+            let mut dt = da & !(TILE - 1);
+            let dend = da.saturating_add(dn);
+            while dt < dend {
+                if let Some(e) = s.mapped.get_mut(&dt) {
+                    e.last_upload_fence = fv;
+                }
+                match dt.checked_add(TILE) {
+                    Some(next) => dt = next,
+                    None => break,
+                }
+            }
+        }
     }
+    s.maybe_sweep_cpu_park();
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
     {
         static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1618,7 +2035,15 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
         if n.is_power_of_two() && n >= 16 {
-            crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
+            crate::xlog_info!(
+                "sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped ({} CPU-parked, {} MB RAM freed, {} unparks)",
+                b >> 20,
+                us / 1000,
+                s.mapped.len(),
+                s.cpu_parked_tiles,
+                (s.cpu_parked_tiles * TILE) >> 20,
+                s.cpu_unpark_count
+            );
             let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
             crate::xlog_info!(
                 "sparse windows timing: write-watch {} ms ({} dirty pages), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs)",
@@ -1687,11 +2112,35 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
 /// to push or take, never across a call out.
 static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// Guard for `STATE` that tracks re-entrancy on the current thread so `cpu_park_veh` never
+/// deadlocks by locking `STATE` recursively.
+struct StateGuard(std::sync::MutexGuard<'static, Option<State>>);
+
+impl std::ops::Deref for StateGuard {
+    type Target = Option<State>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StateGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for StateGuard {
+    fn drop(&mut self) {
+        IN_STATE.with(|c| c.set(false));
+    }
+}
+
 /// `STATE`, with the buffers released while it was held let go first.
-fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
+fn lock_state() -> StateGuard {
     let mut g = STATE.lock().unwrap();
+    IN_STATE.with(|c| c.set(true));
     forget_released(&mut g);
-    g
+    StateGuard(g)
 }
 
 fn forget_released(g: &mut Option<State>) {
@@ -1866,6 +2315,13 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                last_park_sweep: std::time::Instant::now(),
+                park_idle_secs: 0,
+                park_paused_until: None,
+                park_fault_window: std::time::Instant::now(),
+                park_faults_in_window: 0,
+                cpu_parked_tiles: 0,
+                cpu_unpark_count: 0,
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -2074,6 +2530,13 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                last_park_sweep: std::time::Instant::now(),
+                park_idle_secs: 0,
+                park_paused_until: None,
+                park_fault_window: std::time::Instant::now(),
+                park_faults_in_window: 0,
+                cpu_parked_tiles: 0,
+                cpu_unpark_count: 0,
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -2171,6 +2634,13 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                last_park_sweep: std::time::Instant::now(),
+                park_idle_secs: 0,
+                park_paused_until: None,
+                park_fault_window: std::time::Instant::now(),
+                park_faults_in_window: 0,
+                cpu_parked_tiles: 0,
+                cpu_unpark_count: 0,
             };
 
             s.commit_range(base, TILE);
@@ -2296,6 +2766,13 @@ mod tests {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            last_park_sweep: std::time::Instant::now(),
+            park_idle_secs: 0,
+            park_paused_until: None,
+            park_fault_window: std::time::Instant::now(),
+            park_faults_in_window: 0,
+            cpu_parked_tiles: 0,
+            cpu_unpark_count: 0,
         };
         (base, s)
     }
@@ -2557,6 +3034,121 @@ mod tests {
             }
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+        }
+    }
+
+    /// Idle sparse tiles drop their CPU pages (`MEM_DECOMMIT`) once uploaded to VRAM,
+    /// transparently fault back identical bytes from VRAM on CPU read (clearing write-watch),
+    /// abort safely if dirtied before parking, preserve partial holes, and restore via
+    /// `ensure_cpu_resident` without a fault.
+    #[test]
+    fn cpu_park_decommits_idle_tile_and_restores_from_vram_on_touch() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let Some(u) = crate::gpu::uma::get() else { return };
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            if STATE.lock().unwrap().is_none() {
+                init(&dev);
+            }
+            let Some((base, len)) = alloc(3 * TILE, TILE) else { return };
+            let t0 = base;
+            let t1 = base + TILE;
+            let t2 = base + 2 * TILE;
+
+            // Write distinct patterns to t0 (full tile), t1 (partial holes), t2 (dirty-before-park).
+            for i in 0..TILE {
+                *(t0 as *mut u8).add(i) = ((i * 7 + 13) & 0xFF) as u8;
+            }
+            for i in 0..TILE {
+                *(t1 as *mut u8).add(i) = ((i * 11 + 29) & 0xFF) as u8;
+            }
+            // Decommit pages 1..3 of t1 to create partial holes.
+            VirtualFree((t1 + PAGE) as *mut c_void, 2 * PAGE, MEM_DECOMMIT);
+            decommitted(t1 + PAGE, 2 * PAGE);
+
+            // Upload t0 and t1 via before_execute so VRAM holds their exact contents.
+            let mut dirty_pages = Vec::new();
+            for p in (t0..t0 + TILE).step_by(PAGE) {
+                dirty_pages.push(p);
+            }
+            for idx in 0..PAGES_PER_TILE {
+                if idx != 1 && idx != 2 {
+                    dirty_pages.push(t1 + idx * PAGE);
+                }
+            }
+            let q = queue().unwrap();
+            before_execute(&q, &dirty_pages, PAGE);
+
+            // Wait for the upload fence and clear write-watch on t0 and t1.
+            {
+                let g = lock_state();
+                let s = g.as_ref().unwrap();
+                s.wait_for(s.value);
+            }
+            ResetWriteWatch(t0 as *const c_void, 2 * TILE);
+
+            // Dirty t2 AFTER ResetWriteWatch (unsubmitted CPU write): try_park_tile must abort!
+            *(t2 as *mut u32) = 0xDEAD_BEEF;
+
+            // Park t0, t1, t2 directly via try_park_tile.
+            {
+                let mut g = lock_state();
+                let s = g.as_mut().unwrap();
+                let now = std::time::Instant::now();
+                assert!(s.try_park_tile(t0, now), "clean uploaded tile t0 should park");
+                assert!(s.try_park_tile(t1, now), "clean partial-hole tile t1 should park");
+                assert!(!s.try_park_tile(t2, now), "dirty unsubmitted tile t2 must NOT park");
+                assert!(s.mapped[&t0].sent.iter().all(|slot| slot.is_none()), "parked tile must release sent hashes");
+            }
+
+            // Confirm t0's CPU pages are actually decommitted (MEM_RESERVE, not MEM_COMMIT).
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(t0 as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)), 0);
+            assert_ne!(mbi.State, MEM_COMMIT, "t0 CPU pages must be decommitted while parked");
+            assert_eq!(std::ptr::read_volatile(t2 as *const u32), 0xDEAD_BEEF, "t2 write must be preserved");
+
+            // 1. CPU read on parked t0 triggers VEH, restores exact bytes from VRAM, clears write-watch.
+            for i in 0..TILE {
+                assert_eq!(std::ptr::read_volatile((t0 as *const u8).add(i)), ((i * 7 + 13) & 0xFF) as u8, "t0 byte {i}");
+            }
+            let mut ww_addrs = [std::ptr::null_mut::<c_void>(); PAGES_PER_TILE];
+            let mut ww_count = ww_addrs.len();
+            let mut gran = 0u32;
+            assert_eq!(GetWriteWatch(0, t0 as *const c_void, TILE, ww_addrs.as_mut_ptr(), &mut ww_count, &mut gran), 0);
+            assert_eq!(ww_count, 0, "pure read unpark must not leave pages dirty in write-watch");
+
+            // 2. ensure_cpu_resident restores partial-hole tile t1 without a fault and keeps holes uncommitted.
+            ensure_cpu_resident(t1, TILE);
+            for idx in 0..PAGES_PER_TILE {
+                let pg = t1 + idx * PAGE;
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(pg as *const c_void, &mut m, std::mem::size_of_val(&m)), 0);
+                if idx == 1 || idx == 2 {
+                    assert_ne!(m.State, MEM_COMMIT, "hole page {idx} must stay uncommitted after unpark");
+                } else {
+                    assert_eq!(m.State, MEM_COMMIT, "non-hole page {idx} must be committed after unpark");
+                    assert_eq!(std::ptr::read_volatile(pg as *const u8), (((idx * PAGE) * 11 + 29) & 0xFF) as u8);
+                }
+            }
+
+            // 3. Re-park t0 then free/decommit it: must clean up CPU_PARKED without readback.
+            ResetWriteWatch(t0 as *const c_void, TILE);
+            {
+                let mut g = lock_state();
+                let s = g.as_mut().unwrap();
+                assert!(s.try_park_tile(t0, std::time::Instant::now()));
+            }
+            assert!(CPU_PARKED.read().unwrap().contains(&t0));
+            assert!(free(base));
+            assert!(!CPU_PARKED.read().unwrap().contains(&t0));
+            let _ = (u, len);
         }
     }
 }

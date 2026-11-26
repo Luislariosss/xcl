@@ -244,6 +244,7 @@ const MEM_64K_PAGES: u32 = 0x2040_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
+    crate::hle::d3d12x::sparse::ensure_cpu_resident(a, n);
     let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
     if !q.is_null() {
         crate::hle::d3d12x::sparse::committed(q as usize, n);
@@ -493,10 +494,14 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    crate::hle::d3d12x::sparse::ensure_cpu_resident(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    if is_current_process(proc_) {
+        crate::hle::d3d12x::sparse::ensure_cpu_resident(addr as usize, size);
+    }
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
 }
 
@@ -705,6 +710,7 @@ pub unsafe extern "system" fn VirtualQuery(address: *const c_void, mbi: *mut mem
     if let Some(n) = query_committed_window(address, mbi, len) {
         return n;
     }
+    crate::hle::d3d12x::sparse::ensure_cpu_resident(address as usize, 1);
     mem::VirtualQuery(address, mbi, len)
 }
 
@@ -713,6 +719,7 @@ pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_
         if let Some(n) = query_committed_window(address, mbi, len) {
             return n;
         }
+        crate::hle::d3d12x::sparse::ensure_cpu_resident(address as usize, 1);
     }
     mem::VirtualQueryEx(process, address, mbi, len)
 }
