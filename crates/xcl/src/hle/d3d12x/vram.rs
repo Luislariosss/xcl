@@ -523,24 +523,142 @@ fn backoff_active(now_ms: u64, until_ms: u64) -> bool {
     until_ms != 0 && now_ms < until_ms
 }
 
+/// `XCL_VRAM_SYNC_RESIDENCY` (default on, `0` off): value of the variable → whether new pool
+/// heaps are created `NOT_RESIDENT`, made resident explicitly and waited for on a COPY queue.
+fn parse_sync_residency(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| v.trim() == "0")
+}
+
+fn sync_residency() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_sync_residency(std::env::var("XCL_VRAM_SYNC_RESIDENCY").ok().as_deref());
+        if !on {
+            crate::xlog_info!("D3D12.X: XCL_VRAM_SYNC_RESIDENCY=0 - new pool heaps are not waited for on a copy queue");
+        }
+        on
+    })
+}
+
+/// Creation flags of a pool heap: every kind of texture (resource heap tier 2: the only flags
+/// for both), and `NOT_RESIDENT` when its residency is synchronised explicitly.
+fn pool_heap_flags(sync_residency: bool) -> D3D12_HEAP_FLAGS {
+    if sync_residency {
+        D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT
+    } else {
+        D3D12_HEAP_FLAG_NONE
+    }
+}
+
+/// How long one residency wait may take before the heap is used anyway.
+const RESIDENCY_WAIT_MS: u32 = 5_000;
+
+/// A dedicated COPY queue of one device with an empty list: executing it and waiting for its
+/// fence returns only after the `MakeResident` calls made before it have completed.
+struct ResidencySync {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    list: ID3D12CommandList,
+    event: usize,
+    value: u64,
+    // the list is recorded on it
+    _allocator: ID3D12CommandAllocator,
+}
+
+// D3D12 objects are free-threaded; the event is a plain kernel handle
+unsafe impl Send for ResidencySync {}
+
+impl ResidencySync {
+    unsafe fn new(dev: &ID3D12Device) -> Option<ResidencySync> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let queue: ID3D12CommandQueue = dev
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+            .ok()?;
+        let _ = queue.SetName(windows::core::w!("xcl vram residency queue"));
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+        let list: ID3D12GraphicsCommandList =
+            dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None::<&ID3D12PipelineState>).ok()?;
+        list.Close().ok()?;
+        let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        if event.is_null() {
+            return None;
+        }
+        Some(ResidencySync { queue, fence, list: list.cast().ok()?, event: event as usize, value: 0, _allocator: allocator })
+    }
+
+    /// Submit the empty list, signal and wait. `false` when the wait failed or timed out.
+    unsafe fn wait(&mut self) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        self.queue.ExecuteCommandLists(&[Some(self.list.clone())]);
+        let target = self.value + 1;
+        if self.queue.Signal(&self.fence, target).is_err() {
+            return false;
+        }
+        self.value = target;
+        if self.fence.GetCompletedValue() >= target {
+            return true;
+        }
+        if self.fence.SetEventOnCompletion(target, windows::Win32::Foundation::HANDLE(self.event as *mut c_void)).is_err() {
+            return false;
+        }
+        WaitForSingleObject(self.event as _, RESIDENCY_WAIT_MS) == WAIT_OBJECT_0 && self.fence.GetCompletedValue() >= target
+    }
+}
+
+/// device raw pointer → its residency queue (`None`: it could not be made, not tried again)
+static RESIDENCY: Mutex<std::collections::BTreeMap<usize, Option<ResidencySync>>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Wait until the GPU page tables of a heap just made resident are really there. Never fails the
+/// caller: when the queue cannot be made or the wait fails, a warning and the heap is used as is.
+unsafe fn wait_for_residency(dev: &ID3D12Device) {
+    let key = dev.as_raw() as usize;
+    let mut g = RESIDENCY.lock().unwrap();
+    let entry = g.entry(key).or_insert_with(|| {
+        let made = super::title_textures::own_work(|| ResidencySync::new(dev));
+        if made.is_none() {
+            crate::xlog_warn!("D3D12.X: no copy queue to wait for the residency of pool heaps; using them without waiting");
+        }
+        made
+    });
+    if let Some(sync) = entry {
+        if !super::title_textures::own_work(|| sync.wait()) {
+            crate::xlog_warn!("D3D12.X: the copy queue did not confirm the residency of a pool heap within {RESIDENCY_WAIT_MS} ms; using it anyway");
+        }
+    }
+}
+
 /// Allocate one 64 MiB default heap for `Pages`.
 unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     let now_ms = monotonic_ms();
     if backoff_active(now_ms, POOL_GROW_BACKOFF_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)) {
         return None;
     }
+    let sync = sync_residency();
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
         Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
         Alignment: 0,
-        // every kind of texture (resource heap tier 2: the only flags for both)
-        Flags: D3D12_HEAP_FLAG_NONE,
+        Flags: pool_heap_flags(sync),
     };
     let mut heap: Option<ID3D12Heap> = None;
-    if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+    let made = super::title_textures::own_work(|| -> windows::core::Result<()> {
+        dev.CreateHeap(&desc, &mut heap)?;
+        if sync {
+            if let Some(h) = heap.as_ref() {
+                dev.MakeResident(&[Some(h.cast::<ID3D12Pageable>()?)])?;
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = made {
         POOL_GROW_BACKOFF_UNTIL_MS.store(now_ms.saturating_add(POOL_GROW_BACKOFF_MS), std::sync::atomic::Ordering::Relaxed);
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e}); backing off {} ms", POOL_GROW_BACKOFF_MS);
         return None;
+    }
+    if sync && heap.is_some() {
+        wait_for_residency(dev);
     }
     heap
 }
@@ -2338,6 +2456,22 @@ mod tests {
         // zero floor disables pressure
         assert!(st.update(Some(ENTER - 1), ENTER, exit));
         assert!(!st.update(Some(0), 0, 0));
+    }
+
+    #[test]
+    fn sync_residency_flag_parsing() {
+        assert!(parse_sync_residency(None));
+        assert!(parse_sync_residency(Some("1")));
+        assert!(parse_sync_residency(Some("")));
+        assert!(parse_sync_residency(Some("yes")));
+        assert!(!parse_sync_residency(Some("0")));
+        assert!(!parse_sync_residency(Some(" 0 ")));
+    }
+
+    #[test]
+    fn pool_heap_flags_follow_residency_sync() {
+        assert_eq!(pool_heap_flags(true), D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT);
+        assert_eq!(pool_heap_flags(false), D3D12_HEAP_FLAG_NONE);
     }
 
     #[test]
