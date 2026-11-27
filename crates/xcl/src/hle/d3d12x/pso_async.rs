@@ -68,9 +68,14 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     Box::new(move || own)
 }
 
-/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
-fn build(p: &Arc<Pending>, job: Job, preload: bool) {
+/// A worker's build of `p` (`lane`: `Preload` for one of the lowest-priority workers).
+///
+/// The driver's compiler (`amdxc64`) may crash on a shader: the guard (`guard`) knows which
+/// pipeline this thread is building, and a build that takes `SLOW_BUILD` or more is kept for
+/// the next run (`slow`).
+fn build(p: &Arc<Pending>, job: Job, lane: Lane) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    let preload = lane == Lane::Preload;
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
     if preload {
         let mut d = p.demand.lock().unwrap();
@@ -79,7 +84,15 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    let started = std::time::Instant::now();
+    let real = {
+        let _guarded = guard::enter(p, lane);
+        job()
+    };
+    if is_slow_build(started.elapsed()) && p.key != 0 && slow_queue_enabled() && slow::note(p.key) {
+        crate::xlog_info!("D3D12.X: pipeline {:016x} took {} ms to build: its next builds go to the slow queue", p.key, started.elapsed().as_millis());
+    }
+    complete(p, real);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -291,30 +304,122 @@ fn drop_unstarted_job(p: &Pending) {
 
 type Work = Box<dyn FnOnce() + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
-                }
-                work();
-            });
+/// Which workers build a pipeline: the main queue's (`Fast`), the few of the slow queue
+/// (`Slow`: pipelines an earlier run found slow, `slow`) or the lowest-priority ones that build
+/// ahead (`Preload`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    Fast,
+    Slow,
+    Preload,
+}
+
+impl Lane {
+    fn from_u8(v: u8) -> Lane {
+        match v {
+            1 => Lane::Slow,
+            2 => Lane::Preload,
+            _ => Lane::Fast,
         }
-        Mutex::new(tx)
-    })
+    }
+}
+
+/// `XCL_PSO_SLOW_QUEUE=0` (also `XCL_PSO_COMPILER_GUARD`, `XCL_PSO_BAD_CACHE`): off.
+fn flag_on(v: Option<&str>) -> bool {
+    v.map_or(true, |v| v.trim() != "0")
+}
+
+fn slow_queue_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| flag_on(std::env::var("XCL_PSO_SLOW_QUEUE").ok().as_deref()))
+}
+
+/// A build that takes this long makes its pipeline a slow one for the next runs.
+const SLOW_BUILD: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+fn is_slow_build(took: std::time::Duration) -> bool {
+    took >= SLOW_BUILD
+}
+
+/// The workers of the slow queue: a few, so that very slow shaders do not hold up the main ones.
+fn slow_workers_for(compile_threads: usize) -> usize {
+    (compile_threads / 4).max(1)
+}
+
+/// Where a pipeline's build is queued.
+fn route(known_slow: bool, slow_queue: bool) -> Lane {
+    if known_slow && slow_queue {
+        Lane::Slow
+    } else {
+        Lane::Fast
+    }
+}
+
+/// The most builds the driver gets at once: the main workers and the slow queue's.
+fn gate_workers() -> usize {
+    let n = crate::gpu::recomp::dxc::compile_threads();
+    if slow_queue_enabled() {
+        n + slow_workers_for(n)
+    } else {
+        n
+    }
+}
+
+/// A queue of builds and its worker threads (a worker whose build crashed the driver's compiler
+/// is parked for good by `guard`, and a new one takes its place).
+struct Workers {
+    tx: Mutex<mpsc::Sender<Work>>,
+    rx: Arc<Mutex<mpsc::Receiver<Work>>>,
+    lane: Lane,
+    spawned: AtomicUsize,
+}
+
+impl Workers {
+    fn start(lane: Lane, n: usize) -> Workers {
+        let (tx, rx) = mpsc::channel::<Work>();
+        let w = Workers { tx: Mutex::new(tx), rx: Arc::new(Mutex::new(rx)), lane, spawned: AtomicUsize::new(0) };
+        for _ in 0..n {
+            w.spawn_worker();
+        }
+        w
+    }
+
+    fn spawn_worker(&self) {
+        let k = self.spawned.fetch_add(1, Ordering::Relaxed);
+        let (rx, lane) = (self.rx.clone(), self.lane);
+        let name = if lane == Lane::Slow { format!("xcl-pso-slow-{k}") } else { format!("xcl-pso-{k}") };
+        // translation recurses deeply on big programs; DXC itself runs on its own pool
+        let _ = std::thread::Builder::new().name(name).stack_size(64 << 20).spawn(move || loop {
+            let next = rx.lock().unwrap().recv();
+            let Ok(work) = next else { return };
+            if lane == Lane::Fast {
+                while let Some(p) = next_needed() {
+                    build_queued(&p, lane);
+                }
+            }
+            work();
+        });
+    }
+}
+
+fn fast_workers() -> &'static Workers {
+    static W: OnceLock<Workers> = OnceLock::new();
+    W.get_or_init(|| Workers::start(Lane::Fast, crate::gpu::recomp::dxc::compile_threads()))
+}
+
+fn slow_workers() -> &'static Workers {
+    static W: OnceLock<Workers> = OnceLock::new();
+    W.get_or_init(|| Workers::start(Lane::Slow, slow_workers_for(crate::gpu::recomp::dxc::compile_threads())))
+}
+
+fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
+    &fast_workers().tx
 }
 
 fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&p)));
+    let lane = route(slow::known(p.key), slow_queue_enabled());
+    let workers = if lane == Lane::Slow { slow_workers() } else { fast_workers() };
+    let _ = workers.tx.lock().unwrap().send(Box::new(move || build_queued(&p, lane)));
 }
 
 /// Commit-headroom thresholds (`GlobalMemoryStatusEx::ullAvailPageFile`) for throttling background
@@ -365,10 +470,15 @@ struct ActiveWorkerGuard;
 
 impl Drop for ActiveWorkerGuard {
     fn drop(&mut self) {
-        let mut n = ACTIVE_WORKERS.active.lock().unwrap();
-        *n = n.saturating_sub(1);
-        ACTIVE_WORKERS.cv.notify_all();
+        release_gate_slot();
     }
+}
+
+/// A worker slot is free (also the one of a worker parked by `guard`, whose guard never drops).
+fn release_gate_slot() {
+    let mut n = ACTIVE_WORKERS.active.lock().unwrap();
+    *n = n.saturating_sub(1);
+    ACTIVE_WORKERS.cv.notify_all();
 }
 
 fn acquire_worker_slot(max_workers: usize) -> ActiveWorkerGuard {
@@ -393,17 +503,17 @@ fn acquire_worker_slot(max_workers: usize) -> ActiveWorkerGuard {
     }
 }
 
-fn build_queued(p: &Arc<Pending>) {
+fn build_queued(p: &Arc<Pending>, lane: Lane) {
     // (released by the title meanwhile)
     if p.orphan.load(Ordering::Acquire) {
         drop_unstarted_job(p);
         return;
     }
-    let _slot = acquire_worker_slot(crate::gpu::recomp::dxc::compile_threads());
+    let _slot = acquire_worker_slot(gate_workers());
     // (None: a bind took it and builds it itself)
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        build(p, job, false);
+        build(p, job, lane);
     }
 }
 
@@ -483,6 +593,17 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
+    // (the driver's compiler crashed on these shaders in an earlier run: no build, the stand-in stays)
+    if bad::known(key) {
+        drop(p.job.lock().unwrap().take());
+        complete(&p, 0);
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: pipeline {key:016x} crashed the driver's compiler before: it is not built ({} so far)", n + 1);
+        }
+        return;
+    }
     if send {
         enqueue(p);
     } else if used::known(key) {
@@ -573,6 +694,349 @@ mod used {
     }
 }
 
+/// A list of pipeline keys kept between runs in a file beside the DXIL cache, a hexadecimal key
+/// a line as in `used-pipelines.txt` (`bad`, `slow`).
+mod keylist {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::sync::{Mutex, RwLock};
+
+    pub struct KeyList {
+        keys: RwLock<HashSet<u64>>,
+        file: Mutex<Option<std::fs::File>>,
+    }
+
+    impl KeyList {
+        /// A list that is neither read from nor written to a file.
+        pub fn memory() -> KeyList {
+            KeyList { keys: RwLock::new(HashSet::new()), file: Mutex::new(None) }
+        }
+
+        /// The keys in `path` (lines that are not a hexadecimal key are passed over); new ones are appended to it.
+        pub fn open(path: &std::path::Path) -> KeyList {
+            let keys = super::used::parse(&std::fs::read_to_string(path).unwrap_or_default());
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok();
+            KeyList { keys: RwLock::new(keys), file: Mutex::new(file) }
+        }
+
+        pub fn contains(&self, key: u64) -> bool {
+            key != 0 && self.keys.read().unwrap().contains(&key)
+        }
+
+        /// Adds `key` and keeps it for the next run; false when it was there (or 0).
+        pub fn insert(&self, key: u64) -> bool {
+            if key == 0 || !self.keys.write().unwrap().insert(key) {
+                return false;
+            }
+            if let Some(f) = self.file.lock().unwrap().as_mut() {
+                // (one write: a line is not cut by another process's)
+                let _ = f.write_all(format!("{key:016x}\n").as_bytes());
+            }
+            true
+        }
+
+        pub fn len(&self) -> usize {
+            self.keys.read().unwrap().len()
+        }
+    }
+}
+
+/// The pipelines whose build crashed the driver's compiler (`bad-pipelines.txt` beside the DXIL
+/// cache, `XCL_PSO_BAD_CACHE=0`: the file is neither read nor written): they are not built again,
+/// the title keeps their stand-in. Told by `guard`.
+mod bad {
+    use super::keylist::KeyList;
+    use std::sync::OnceLock;
+
+    fn list() -> &'static KeyList {
+        static L: OnceLock<KeyList> = OnceLock::new();
+        L.get_or_init(|| {
+            // (a test neither reads nor writes the user's file)
+            if cfg!(test) || !super::flag_on(std::env::var("XCL_PSO_BAD_CACHE").ok().as_deref()) {
+                return KeyList::memory();
+            }
+            let list = KeyList::open(&crate::gpu::recomp::dxc::cache_dir().join("bad-pipelines.txt"));
+            if list.len() != 0 {
+                crate::xlog_warn!("D3D12.X: {} shader sets crashed the driver's compiler in earlier runs: their pipelines are not built", list.len());
+            }
+            list
+        })
+    }
+
+    /// The driver's compiler crashed on a pipeline of these shaders (or an earlier run's did).
+    pub fn known(key: u64) -> bool {
+        list().contains(key)
+    }
+
+    /// Kept for the next run; false when it was known.
+    pub fn note(key: u64) -> bool {
+        list().insert(key)
+    }
+}
+
+/// The pipelines whose build took `SLOW_BUILD` or more (`slow-pipelines.txt` beside the DXIL
+/// cache, `XCL_PSO_SLOW_QUEUE=0`: off): in later runs they are built on the few workers of their
+/// own (`Lane::Slow`), so that they do not hold up the ones that build the fast pipelines.
+mod slow {
+    use super::keylist::KeyList;
+    use std::sync::OnceLock;
+
+    fn list() -> &'static KeyList {
+        static L: OnceLock<KeyList> = OnceLock::new();
+        L.get_or_init(|| {
+            if cfg!(test) || !super::slow_queue_enabled() {
+                return KeyList::memory();
+            }
+            let list = KeyList::open(&crate::gpu::recomp::dxc::cache_dir().join("slow-pipelines.txt"));
+            if list.len() != 0 {
+                crate::xlog_info!("D3D12.X: {} shader sets built slowly in earlier runs: their pipelines go to the slow queue", list.len());
+            }
+            list
+        })
+    }
+
+    pub fn known(key: u64) -> bool {
+        list().contains(key)
+    }
+
+    /// Kept for the next run; false when it was known.
+    pub fn note(key: u64) -> bool {
+        list().insert(key)
+    }
+}
+
+/// Protection against the driver's compiler (`amdxc64`) crashing in a worker's build: an access
+/// violation there ends the whole process, and one shader set that does it ends every run.
+/// `XCL_PSO_COMPILER_GUARD=0`: off (a test has none).
+///
+/// A worker tells which pipeline it builds in a slot of its own (atomics only). A vectored
+/// handler looks at an access violation: on a worker that builds, it marks the slot, wakes the
+/// watchdog thread and parks the worker for good – its stack is of no use any more. It takes no
+/// lock and allocates nothing: it runs on a thread that may hold the heap's or the driver's
+/// locks. The watchdog completes the pipeline as failed (the title keeps the stand-in), keeps its
+/// key in `bad`, frees the worker's slot of the driver's builds and starts a worker in its place.
+/// A build helper (`build_pieces`) is not watched.
+mod guard {
+    use super::{bad, complete, release_gate_slot, Lane, Pending};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::{Arc, Once, OnceLock};
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, HANDLE};
+    use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
+    use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentThreadId, SetEvent, WaitForSingleObject, INFINITE};
+
+    const MAX_SLOTS: usize = 256;
+    const IDLE: u8 = 0;
+    const BUILDING: u8 = 1;
+    const CRASHED: u8 = 2;
+    const HANDLED: u8 = 3;
+
+    /// What the worker thread `tid` is building.
+    pub struct Slot {
+        tid: AtomicU32,
+        state: AtomicU8,
+        lane: AtomicU8,
+        key: AtomicU64,
+        /// `Arc::as_ptr` of the `Pending`: the worker's `BUILDING` keeps it alive, and a parked worker never lets go
+        pending: AtomicUsize,
+        fault: AtomicUsize,
+    }
+
+    impl Slot {
+        pub const fn new() -> Slot {
+            Slot { tid: AtomicU32::new(0), state: AtomicU8::new(IDLE), lane: AtomicU8::new(0), key: AtomicU64::new(0), pending: AtomicUsize::new(0), fault: AtomicUsize::new(0) }
+        }
+
+        pub fn begin(&self, key: u64, pending: usize, lane: Lane) {
+            self.key.store(key, Ordering::Relaxed);
+            self.pending.store(pending, Ordering::Relaxed);
+            self.lane.store(lane as u8, Ordering::Relaxed);
+            self.state.store(BUILDING, Ordering::Release);
+        }
+
+        pub fn end(&self) {
+            let _ = self.state.compare_exchange(BUILDING, IDLE, Ordering::AcqRel, Ordering::Relaxed);
+        }
+
+        /// The access violation at `fault` hit the thread while it built: true when this marked the slot.
+        pub fn crashed(&self, fault: usize) -> bool {
+            let marked = self.state.compare_exchange(BUILDING, CRASHED, Ordering::AcqRel, Ordering::Relaxed).is_ok();
+            if marked {
+                self.fault.store(fault, Ordering::Relaxed);
+            }
+            marked
+        }
+
+        /// The watchdog takes a crashed slot over (once).
+        pub fn claim(&self) -> bool {
+            self.state.compare_exchange(CRASHED, HANDLED, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        }
+
+        #[cfg(test)]
+        pub fn state(&self) -> u8 {
+            self.state.load(Ordering::Acquire)
+        }
+    }
+
+    static SLOTS: [Slot; MAX_SLOTS] = [const { Slot::new() }; MAX_SLOTS];
+    /// slots taken (more than `MAX_SLOTS`: threads without one are not watched)
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    /// auto-reset event: a worker crashed
+    static WAKE: AtomicUsize = AtomicUsize::new(0);
+    /// manual-reset event nobody sets: where a crashed worker waits
+    static PARK: AtomicUsize = AtomicUsize::new(0);
+    static READY: AtomicBool = AtomicBool::new(false);
+    static INSTALL: Once = Once::new();
+
+    thread_local! {
+        static MINE: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| !cfg!(test) && super::flag_on(std::env::var("XCL_PSO_COMPILER_GUARD").ok().as_deref()))
+    }
+
+    /// The thread's slot (taken on its first build).
+    fn my_slot() -> Option<&'static Slot> {
+        MINE.with(|m| match m.get() {
+            usize::MAX => {
+                let i = NEXT.fetch_add(1, Ordering::AcqRel);
+                if i >= MAX_SLOTS {
+                    m.set(MAX_SLOTS);
+                    return None;
+                }
+                SLOTS[i].tid.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+                m.set(i);
+                Some(&SLOTS[i])
+            }
+            i if i < MAX_SLOTS => Some(&SLOTS[i]),
+            _ => None,
+        })
+    }
+
+    /// The build of this thread is watched while this lives.
+    pub struct Entered(&'static Slot);
+
+    impl Drop for Entered {
+        fn drop(&mut self) {
+            self.0.end();
+        }
+    }
+
+    /// This worker builds `p`.
+    pub fn enter(p: &Arc<Pending>, lane: Lane) -> Option<Entered> {
+        if !enabled() {
+            return None;
+        }
+        INSTALL.call_once(install);
+        if !READY.load(Ordering::Acquire) {
+            return None;
+        }
+        let slot = my_slot()?;
+        slot.begin(p.key, Arc::as_ptr(p) as usize, lane);
+        Some(Entered(slot))
+    }
+
+    fn install() {
+        unsafe {
+            let wake = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let park = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            if wake as usize == 0 || park as usize == 0 {
+                crate::xlog_warn!("D3D12.X: no events for the compiler guard: the driver's compiler crashing is not handled");
+                return;
+            }
+            WAKE.store(wake as usize, Ordering::Release);
+            PARK.store(park as usize, Ordering::Release);
+            if std::thread::Builder::new().name("xcl-pso-guard".into()).spawn(watchdog).is_err() {
+                return;
+            }
+            if AddVectoredExceptionHandler(1, Some(handler)).is_null() {
+                return;
+            }
+        }
+        READY.store(true, Ordering::Release);
+        crate::xlog_info!("D3D12.X: the driver's compiler crashing in a pipeline build is handled (`XCL_PSO_COMPILER_GUARD=0`: off)");
+    }
+
+    /// Runs where the exception is raised: no lock, no allocation.
+    unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+        let rec = (*info).ExceptionRecord;
+        if rec.is_null() || (*rec).ExceptionCode != EXCEPTION_ACCESS_VIOLATION {
+            return 0;
+        }
+        let tid = GetCurrentThreadId();
+        let taken = NEXT.load(Ordering::Acquire).min(MAX_SLOTS);
+        for slot in &SLOTS[..taken] {
+            if slot.tid.load(Ordering::Acquire) != tid {
+                continue;
+            }
+            if slot.crashed((*rec).ExceptionAddress as usize) {
+                SetEvent(WAKE.load(Ordering::Acquire) as HANDLE);
+                WaitForSingleObject(PARK.load(Ordering::Acquire) as HANDLE, INFINITE);
+            }
+            break;
+        }
+        0
+    }
+
+    fn watchdog() {
+        let wake = WAKE.load(Ordering::Acquire) as HANDLE;
+        loop {
+            if unsafe { WaitForSingleObject(wake, INFINITE) } != 0 {
+                return;
+            }
+            let taken = NEXT.load(Ordering::Acquire).min(MAX_SLOTS);
+            for slot in &SLOTS[..taken] {
+                if slot.claim() {
+                    recover(slot);
+                }
+            }
+        }
+    }
+
+    fn recover(slot: &Slot) {
+        let key = slot.key.load(Ordering::Relaxed);
+        let lane = Lane::from_u8(slot.lane.load(Ordering::Relaxed));
+        let pending = slot.pending.load(Ordering::Relaxed);
+        if key != 0 {
+            bad::note(key);
+        }
+        crate::xlog_warn!(
+            "D3D12.X: the driver's compiler crashed (access violation at {:#x}) building pipeline {key:016x}: its build is given up, the title keeps the stand-in",
+            slot.fault.load(Ordering::Relaxed)
+        );
+        if pending != 0 {
+            let p = unsafe {
+                Arc::increment_strong_count(pending as *const Pending);
+                Arc::from_raw(pending as *const Pending)
+            };
+            complete(&p, 0);
+        }
+        // (the parked worker never lets go of its slot of the driver's builds)
+        if lane != Lane::Preload {
+            release_gate_slot();
+        }
+        super::replace_worker(lane);
+    }
+}
+
+/// A worker is gone (`guard`): another takes its place.
+fn replace_worker(lane: Lane) {
+    match lane {
+        Lane::Fast => fast_workers().spawn_worker(),
+        Lane::Slow => slow_workers().spawn_worker(),
+        Lane::Preload => {
+            if let Some(q) = preload() {
+                spawn_preload_worker(q);
+            }
+        }
+    }
+}
+
 /// The workers that build the pipelines of an earlier run ahead of their first use
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
@@ -595,45 +1059,52 @@ fn preload() -> Option<&'static Preload> {
         .as_ref()?;
     STARTED.call_once(|| {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
-        for k in 0..n {
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
-                unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-                }
-                static DONE: AtomicUsize = AtomicUsize::new(0);
-                loop {
-                    while mem_throttle_enabled() && should_pause_preload(avail_commit_bytes()) {
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
-                    let p = {
-                        let mut g = q.list.lock().unwrap();
-                        loop {
-                            if let Some(p) = g.pop_front() {
-                                break p;
-                            }
-                            g = q.cv.wait(g).unwrap();
-                        }
-                    };
-                    // (released by the title meanwhile)
-                    if p.orphan.load(Ordering::Acquire) {
-                        drop_unstarted_job(&p);
-                        continue;
-                    }
-                    // (None: a bind took it and builds it itself)
-                    let job = p.job.lock().unwrap().take();
-                    if let Some(job) = job {
-                        build(&p, job, true);
-                        let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
-                        }
-                    }
-                }
-            });
+        for _ in 0..n {
+            spawn_preload_worker(q);
         }
     });
     Some(q)
+}
+
+/// One of the lowest-priority workers (a new one also takes the place of a parked one, `guard`).
+fn spawn_preload_worker(q: &'static Preload) {
+    static SPAWNED: AtomicUsize = AtomicUsize::new(0);
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    let k = SPAWNED.fetch_add(1, Ordering::Relaxed);
+    let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        }
+        loop {
+            while mem_throttle_enabled() && should_pause_preload(avail_commit_bytes()) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let p = {
+                let mut g = q.list.lock().unwrap();
+                loop {
+                    if let Some(p) = g.pop_front() {
+                        break p;
+                    }
+                    g = q.cv.wait(g).unwrap();
+                }
+            };
+            // (released by the title meanwhile)
+            if p.orphan.load(Ordering::Acquire) {
+                drop_unstarted_job(&p);
+                continue;
+            }
+            // (None: a bind took it and builds it itself)
+            let job = p.job.lock().unwrap().take();
+            if let Some(job) = job {
+                build(&p, job, Lane::Preload);
+                let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -890,7 +1361,7 @@ mod used_tests {
         released(unknown);
     }
 
-    static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
 
     /// A queued normal worker job whose stand-in was released before a worker starts it is
     /// skipped as orphaned instead of entering the compiler.
@@ -1333,5 +1804,151 @@ mod commit_throttle_tests {
         assert!(!should_pause_preload(Some(PRELOAD_PAUSE_COMMIT)));
         assert!(should_pause_preload(Some(PRELOAD_PAUSE_COMMIT - 1)));
         assert!(should_pause_preload(Some(0)));
+    }
+}
+
+#[cfg(test)]
+mod guard_queue_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn temp_file(name: &str) -> std::path::PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!("xcl-pso-{name}-{}-{}.txt", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    /// `bad-pipelines.txt` and `slow-pipelines.txt` hold a hexadecimal key a line: other lines and
+    /// 0 are passed over, a key is kept once, and the next run reads what this one wrote.
+    #[test]
+    fn the_key_lists_are_read_and_kept_between_runs() {
+        let path = temp_file("keys");
+        std::fs::write(&path, "00000000000000ff\nnot a key\n\n0\n 1a2b \n").unwrap();
+        let list = keylist::KeyList::open(&path);
+        assert_eq!(list.len(), 2);
+        assert!(list.contains(0xff) && list.contains(0x1a2b));
+        assert!(!list.contains(0), "0 is no key");
+        assert!(!list.insert(0xff), "already there");
+        assert!(!list.insert(0));
+        assert!(list.insert(0xBEEF_0001));
+        assert!(list.contains(0xBEEF_0001));
+        drop(list);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with("00000000beef0001\n"), "appended a line: {text:?}");
+        let next = keylist::KeyList::open(&path);
+        assert_eq!(next.len(), 3);
+        assert!(next.contains(0xBEEF_0001) && next.contains(0xff));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A list that is no file's (a test, or `XCL_PSO_BAD_CACHE=0`) keeps its keys for the run only.
+    #[test]
+    fn a_memory_list_writes_nothing() {
+        let list = keylist::KeyList::memory();
+        assert!(list.insert(7) && list.contains(7) && !list.insert(7));
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn the_switches_are_on_unless_set_to_zero() {
+        assert!(flag_on(None));
+        assert!(flag_on(Some("1")));
+        assert!(flag_on(Some("")));
+        assert!(!flag_on(Some("0")));
+        assert!(!flag_on(Some(" 0 ")));
+    }
+
+    /// Only a pipeline an earlier run found slow goes to the slow queue, and only with it on.
+    #[test]
+    fn slow_pipelines_are_routed_to_the_slow_queue() {
+        assert_eq!(route(false, true), Lane::Fast);
+        assert_eq!(route(true, true), Lane::Slow);
+        assert_eq!(route(true, false), Lane::Fast, "the slow queue is off");
+        assert_eq!(route(false, false), Lane::Fast);
+        assert!(!is_slow_build(Duration::from_millis(999)));
+        assert!(is_slow_build(Duration::from_millis(1_000)));
+        assert!(is_slow_build(Duration::from_secs(30)));
+    }
+
+    /// A quarter of the compile threads, never none.
+    #[test]
+    fn the_slow_queue_has_a_few_workers() {
+        assert_eq!(slow_workers_for(0), 1);
+        assert_eq!(slow_workers_for(1), 1);
+        assert_eq!(slow_workers_for(4), 1);
+        assert_eq!(slow_workers_for(8), 2);
+        assert_eq!(slow_workers_for(16), 4);
+        assert!(gate_workers() > crate::gpu::recomp::dxc::compile_threads() || !slow_queue_enabled());
+    }
+
+    /// A slot marks a crash only while its worker builds, and the watchdog takes it over once.
+    #[test]
+    fn a_slot_marks_a_crash_only_while_it_builds() {
+        let slot = guard::Slot::new();
+        assert!(!slot.crashed(0x10), "no build, no crash");
+        slot.begin(0x5EED, 0, Lane::Slow);
+        slot.end();
+        assert!(!slot.crashed(0x10), "the build is over");
+        slot.begin(0x5EED, 0, Lane::Slow);
+        assert!(slot.crashed(0x10));
+        assert!(!slot.crashed(0x10), "marked once");
+        slot.end();
+        assert_eq!(slot.state(), 2, "a crashed worker never ends its build");
+        assert!(slot.claim());
+        assert!(!slot.claim(), "taken over once");
+        assert_eq!(slot.state(), 3);
+    }
+
+    /// The pipeline of shaders that crashed the driver's compiler is not sent to the workers: it
+    /// is done at once, failed, and its build never runs.
+    #[test]
+    fn a_pipeline_that_crashed_the_compiler_is_not_built() {
+        let (standin, key) = (0x7E57_BAD1usize, 0x5EED_BAD1u64);
+        assert!(!bad::known(key));
+        assert!(bad::note(key) && bad::known(key) && !bad::note(key));
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_job = ran.clone();
+        submit_lazy(standin, false, Box::new(move || {
+            ran_job.store(true, Ordering::Release);
+            0xBAD1
+        }), key);
+        assert!(!is_pending(standin), "nothing to wait for");
+        assert_eq!(resolve(standin), standin, "the stand-in stays");
+        assert_eq!(resolve_wait(standin), standin);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!ran.load(Ordering::Acquire), "the build reached the compiler");
+        assert_eq!(released(standin), 0);
+    }
+
+    /// A pipeline an earlier run found slow is built by a slow worker, another by a main one.
+    #[test]
+    fn slow_and_fast_pipelines_are_built_by_their_own_workers() {
+        let _sat = used_tests::WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (slow_key, fast_key) = (0x5EED_5100u64, 0x5EED_5101u64);
+        assert!(slow::note(slow_key));
+        let (tx, rx) = mpsc::channel();
+        let standins = [(0x7E57_5100usize, slow_key), (0x7E57_5101usize, fast_key)];
+        for (standin, key) in standins {
+            let tx = tx.clone();
+            submit_lazy(standin, false, Box::new(move || {
+                let _ = tx.send((key, std::thread::current().name().unwrap_or("").to_string()));
+                0x5100
+            }), key);
+            let _ = resolve(standin);
+        }
+        for _ in 0..2 {
+            let (key, thread) = rx.recv_timeout(Duration::from_secs(10)).expect("built by a worker");
+            if key == slow_key {
+                assert!(thread.starts_with("xcl-pso-slow-"), "slow pipeline built on {thread}");
+            } else {
+                assert!(thread.starts_with("xcl-pso-") && !thread.starts_with("xcl-pso-slow-"), "fast pipeline built on {thread}");
+            }
+        }
+        for (standin, _) in standins {
+            let start = std::time::Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = released(standin);
+        }
     }
 }
