@@ -122,9 +122,12 @@ const DEFAULT_CPU_PARK_SECS: u64 = 30;
 /// Maximum adaptive idle duration when re-faults indicate thrashing.
 const MAX_CPU_PARK_SECS: u64 = 300;
 /// Minimum interval between background parking sweeps inside `before_execute`.
-const CPU_PARK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-/// Maximum number of tiles parked in one sweep (512 tiles = 32 MiB) to bound per-submit latency.
-const CPU_PARK_BATCH: usize = 512;
+const CPU_PARK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Faster sweep interval when Windows commit headroom is low.
+const CPU_PARK_SWEEP_INTERVAL_LOW: std::time::Duration = std::time::Duration::from_millis(500);
+/// Default maximum number of tiles parked in one sweep (1024 tiles = 64 MiB), overridable via
+/// `XCL_SPARSE_PARK_BATCH`. Doubled under low commit headroom.
+const DEFAULT_CPU_PARK_BATCH: usize = 1024;
 /// Re-faults per second above which the adaptive idle threshold doubles (or pauses).
 const CPU_PARK_FAULT_RATE_LIMIT: u32 = 64;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -147,6 +150,17 @@ fn cpu_park_base_secs() -> u64 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_CPU_PARK_SECS)
+    })
+}
+
+fn cpu_park_batch_tiles() -> usize {
+    static BATCH: OnceLock<usize> = OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("XCL_SPARSE_PARK_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CPU_PARK_BATCH)
     })
 }
 
@@ -1558,12 +1572,15 @@ impl State {
         if self.park_paused_until.is_some_and(|until| now < until) {
             return;
         }
-        if now.duration_since(self.last_park_sweep) < CPU_PARK_SWEEP_INTERVAL {
+        let low = super::vram::commit_low();
+        let interval = if low { CPU_PARK_SWEEP_INTERVAL_LOW } else { CPU_PARK_SWEEP_INTERVAL };
+        if now.duration_since(self.last_park_sweep) < interval {
             return;
         }
         self.last_park_sweep = now;
-        let idle = std::time::Duration::from_secs(self.park_idle_secs);
-        self.sweep_cpu_park_now(idle, CPU_PARK_BATCH);
+        let idle_secs = if low { (self.park_idle_secs / 2).max(3) } else { self.park_idle_secs };
+        let batch = if low { cpu_park_batch_tiles().saturating_mul(2) } else { cpu_park_batch_tiles() };
+        self.sweep_cpu_park_now(std::time::Duration::from_secs(idle_secs), batch);
     }
 }
 
