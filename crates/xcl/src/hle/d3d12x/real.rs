@@ -4467,10 +4467,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
-            driver_cache::keep(p, &b, in_driver);
-        }
+        keep_compute_blob(key, *ppv, dxil.len(), disk.as_deref().map(|p| (p, in_driver)));
     } else if reused && from_disk {
         driver_cache::note(true, None);
     }
@@ -4527,7 +4524,7 @@ pub(crate) mod driver_cache {
         format!("gfx-{hash:016x}-{bytes:x}.pso")
     }
 
-    fn enabled() -> bool {
+    pub(super) fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
     }
@@ -4605,14 +4602,16 @@ pub(crate) mod driver_cache {
         took >= KEEP || keep_fixtures()
     }
 
-    /// Keep `blob`, of a build that took `took`, for the next run.
-    pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
-        if worth_keeping(took) && write(p, blob) {
-            let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
-                crate::xlog_info!("D3D12.X: {n} driver blobs kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), blob.len() >> 10);
-            }
+    /// Keep `blob`, of a build that took `took`, for the next run. True when it is on disk now.
+    pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) -> bool {
+        if !(worth_keeping(took) && write(p, blob)) {
+            return false;
         }
+        let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: {n} driver blobs kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), blob.len() >> 10);
+        }
+        true
     }
 
     #[cfg(test)]
@@ -4796,6 +4795,58 @@ mod compute_blob_tests {
     }
 }
 
+#[cfg(test)]
+mod blob_ram_policy_tests {
+    use super::*;
+
+    const MIB: usize = 1 << 20;
+
+    #[test]
+    fn without_the_disk_cache_the_old_caps_stay() {
+        for persisted in [false, true] {
+            assert_eq!(blob_ram_cap_for(COMPUTE_BLOBS_MAX, false, None, persisted), 512 * MIB);
+            assert_eq!(blob_ram_cap_for(GRAPHICS_BLOBS_MAX, false, None, persisted), 256 * MIB);
+            // the RAM setting only applies together with the disk cache
+            assert_eq!(blob_ram_cap_for(GRAPHICS_BLOBS_MAX, false, Some(1), persisted), 256 * MIB);
+        }
+    }
+
+    #[test]
+    fn with_the_disk_cache_ram_holds_a_small_working_set() {
+        assert_eq!(blob_ram_cap_for(COMPUTE_BLOBS_MAX, true, None, true), 32 * MIB);
+        assert_eq!(blob_ram_cap_for(GRAPHICS_BLOBS_MAX, true, None, false), 32 * MIB);
+        assert_eq!(blob_ram_cap_for(COMPUTE_BLOBS_MAX, true, Some(8), true), 8 * MIB);
+        // never above the cap without the disk cache
+        assert_eq!(blob_ram_cap_for(GRAPHICS_BLOBS_MAX, true, Some(100_000), true), 256 * MIB);
+        assert_eq!(blob_ram_cap_for(GRAPHICS_BLOBS_MAX, true, Some(usize::MAX), true), 256 * MIB);
+    }
+
+    #[test]
+    fn zero_keeps_nothing_in_ram_that_is_on_disk_but_does_not_lose_an_unwritten_blob() {
+        assert_eq!(blob_ram_cap_for(COMPUTE_BLOBS_MAX, true, Some(0), true), 0);
+        assert!(!blob_fits(0, 1, 0));
+        assert_eq!(blob_ram_cap_for(COMPUTE_BLOBS_MAX, true, Some(0), false), 32 * MIB);
+    }
+
+    #[test]
+    fn a_blob_fits_only_below_the_cap_and_never_empty() {
+        assert!(blob_fits(0, 10, 10));
+        assert!(!blob_fits(1, 10, 10));
+        assert!(blob_fits(22, 10, 32));
+        assert!(!blob_fits(23, 10, 32));
+        assert!(!blob_fits(0, 0, 10), "an empty blob is not kept");
+        assert!(!blob_fits(50, 1, 10), "a total above the cap does not underflow");
+    }
+
+    #[test]
+    fn low_commit_drops_ram_blobs_only_when_the_disk_can_serve_them() {
+        assert!(blob_ram_shed(true, true));
+        assert!(!blob_ram_shed(true, false));
+        assert!(!blob_ram_shed(false, true));
+        assert!(!blob_ram_shed(false, false));
+    }
+}
+
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
 unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     if pso.is_null() {
@@ -4822,18 +4873,95 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
 
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
 /// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() || compute_blob(key).is_some() {
+///
+/// `disk`: the file for the next run and how long the build took (`driver_cache::keep`). The blob
+/// goes to disk first, then to RAM under [`blob_ram_cap`]: with the disk cache on, RAM holds only
+/// a small working set (a later build of the same program reads its file).
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize, disk: Option<(&std::path::Path, std::time::Duration)>) {
+    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() {
         return;
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
+    let (blob, fresh) = match compute_blob(key) {
+        Some(blob) => (blob, false),
+        None => match read_pso_cached_blob(pso) {
+            Some(bytes) if !bytes.is_empty() => (std::sync::Arc::new(bytes), true),
+            _ => return,
+        },
+    };
+    let persisted = disk.is_some_and(|(p, took)| driver_cache::keep(p, &blob, took));
+    if fresh {
+        remember_compute_blob(key, blob, persisted);
+    }
+}
+
+/// Default RAM cap of each of `COMPUTE_BLOBS` and `GRAPHICS_BLOBS` while the disk cache is on.
+const BLOB_RAM_DISK_DEFAULT_MB: usize = 32;
+
+/// `XCL_PSO_RAM_BLOB_MB`: the RAM cap in MiB of each blob map while the disk cache is on.
+fn blob_ram_mb() -> Option<usize> {
+    static MB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("XCL_PSO_RAM_BLOB_MB").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The RAM cap in bytes of a blob map whose limit without a disk cache is `base`.
+///
+/// Without the disk cache: `base`. With it: `ram_mb` MiB (default 32), never above `base`; `0`
+/// keeps nothing in RAM that is on disk (`persisted`), while a blob that could not be written
+/// still gets the default cap rather than being lost to the next build in this run.
+fn blob_ram_cap_for(base: usize, disk: bool, ram_mb: Option<usize>, persisted: bool) -> usize {
+    if !disk {
+        return base;
+    }
+    let mb = match ram_mb {
+        Some(0) if !persisted => BLOB_RAM_DISK_DEFAULT_MB,
+        Some(mb) => mb,
+        None => BLOB_RAM_DISK_DEFAULT_MB,
+    };
+    mb.saturating_mul(1 << 20).min(base)
+}
+
+fn blob_ram_cap(base: usize, persisted: bool) -> usize {
+    blob_ram_cap_for(base, driver_cache::enabled(), blob_ram_mb(), persisted)
+}
+
+/// A blob of `len` bytes goes into a map holding `total` under `cap`.
+fn blob_fits(total: usize, len: usize, cap: usize) -> bool {
+    len != 0 && len <= cap.saturating_sub(total)
+}
+
+/// Both blob maps are dropped (and nothing is added) while commit is low and the disk cache
+/// can serve them again.
+fn blob_ram_shed(disk: bool, commit_low: bool) -> bool {
+    disk && commit_low
+}
+
+fn shed_blobs_under_pressure() -> bool {
+    if !blob_ram_shed(driver_cache::enabled(), super::vram::commit_low()) {
+        return false;
+    }
+    if let Some((m, total)) = COMPUTE_BLOBS.lock().unwrap().as_mut() {
+        m.clear();
+        *total = 0;
+    }
+    if let Some((m, total)) = GRAPHICS_BLOBS.lock().unwrap().as_mut() {
+        m.clear();
+        *total = 0;
+    }
+    true
+}
+
+fn remember_compute_blob(key: (u64, usize, i32), blob: std::sync::Arc<Vec<u8>>, persisted: bool) {
+    if shed_blobs_under_pressure() {
+        return;
+    }
+    let cap = blob_ram_cap(COMPUTE_BLOBS_MAX, persisted);
     let mut g = COMPUTE_BLOBS.lock().unwrap();
     let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
+    if m.contains_key(&key) || !blob_fits(*total, blob.len(), cap) {
         return;
     }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    *total += blob.len();
+    m.insert(key, blob);
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
@@ -4855,19 +4983,33 @@ fn forget_graphics_blob(key: (u64, usize), rejected: &std::sync::Arc<Vec<u8>>) -
     true
 }
 
-unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
-    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() || graphics_blob(key).is_some() {
+/// Like [`keep_compute_blob`], for a translated graphics pipeline.
+unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize, disk: Option<(&std::path::Path, std::time::Duration)>) {
+    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() {
         return;
     }
-    if let Some(bytes) = read_pso_cached_blob(pso) {
-        remember_graphics_blob(key, std::sync::Arc::new(bytes));
+    let (blob, fresh) = match graphics_blob(key) {
+        Some(blob) => (blob, false),
+        None => match read_pso_cached_blob(pso) {
+            Some(bytes) if !bytes.is_empty() => (std::sync::Arc::new(bytes), true),
+            _ => return,
+        },
+    };
+    let persisted = disk.is_some_and(|(p, took)| driver_cache::keep(p, &blob, took));
+    if fresh {
+        remember_graphics_blob(key, blob, persisted);
     }
 }
 
-fn remember_graphics_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>) {
+/// `persisted`: the blob is on disk, so RAM may drop it (see [`blob_ram_cap_for`]).
+fn remember_graphics_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>, persisted: bool) {
+    if shed_blobs_under_pressure() {
+        return;
+    }
+    let cap = blob_ram_cap(GRAPHICS_BLOBS_MAX, persisted);
     let mut cache = GRAPHICS_BLOBS.lock().unwrap();
     let (blobs, total) = cache.get_or_insert_with(|| (HashMap::new(), 0));
-    if blob.is_empty() || blobs.contains_key(&key) || blob.len() > GRAPHICS_BLOBS_MAX.saturating_sub(*total) {
+    if blobs.contains_key(&key) || !blob_fits(*total, blob.len(), cap) {
         return;
     }
     *total += blob.len();
@@ -5305,10 +5447,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     );
     let hr = build.hr;
     if build.cache_eligible {
-        keep_graphics_blob(gkey, *ppv, bytes);
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
-            driver_cache::keep(p, &b, build.in_driver);
-        }
+        keep_graphics_blob(gkey, *ppv, bytes, disk.as_deref().map(|p| (p, build.in_driver)));
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
     }
@@ -5394,23 +5533,150 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 /// A pipeline description that owns what it points to (shader blobs, input layout and its
 /// semantic names), so a worker can build the pipeline after the title's memory is gone.
 /// The root signature pointer is kept as is (the translated paths replace it).
+///
+/// Shader blobs are interned (`intern_shader`): the tens of thousands of lazy pipelines of a
+/// title share a few thousand distinct programs, so each one holds a handle to the one copy.
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<[u8]>>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<[u8]>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<std::sync::Arc<[u8]>>),
 }
 
 unsafe impl Send for OwnedDesc {}
 
+/// Immutable shader blobs, one live copy per distinct content. Entries are weak: a blob lives
+/// while some pipeline description holds it. Equal hash and length are only a bucket: a hit
+/// needs equal bytes, so a hash collision never shares the wrong shader.
+#[derive(Default)]
+struct ShaderInterner {
+    map: HashMap<(u64, usize), Vec<std::sync::Weak<[u8]>>>,
+    /// size of `map` that triggers the next sweep of dead entries
+    sweep_at: usize,
+}
+
+/// `map` size that first triggers a sweep of dead entries.
+const INTERN_SWEEP_MIN: usize = 4096;
+
+impl ShaderInterner {
+    fn intern(&mut self, bytes: &[u8]) -> std::sync::Arc<[u8]> {
+        self.intern_in((crate::gpu::shader::fnv64(bytes), bytes.len()), bytes)
+    }
+
+    fn intern_in(&mut self, key: (u64, usize), bytes: &[u8]) -> std::sync::Arc<[u8]> {
+        if let Some(bucket) = self.map.get_mut(&key) {
+            let mut found = None;
+            bucket.retain(|w| match w.upgrade() {
+                Some(a) => {
+                    if found.is_none() && *a == *bytes {
+                        found = Some(a);
+                    }
+                    true
+                }
+                None => false,
+            });
+            if let Some(a) = found {
+                return a;
+            }
+            let a: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+            bucket.push(std::sync::Arc::downgrade(&a));
+            return a;
+        }
+        if self.map.len() >= self.sweep_at.max(INTERN_SWEEP_MIN) {
+            self.sweep();
+            self.sweep_at = self.map.len().saturating_mul(2).max(INTERN_SWEEP_MIN);
+        }
+        let a: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+        self.map.insert(key, vec![std::sync::Arc::downgrade(&a)]);
+        a
+    }
+
+    /// Forget the entries whose blobs are all gone.
+    fn sweep(&mut self) {
+        self.map.retain(|_, bucket| {
+            bucket.retain(|w| w.strong_count() > 0);
+            !bucket.is_empty()
+        });
+    }
+}
+
+static SHADER_INTERN: Mutex<Option<ShaderInterner>> = Mutex::new(None);
+
+fn intern_shader(bytes: &[u8]) -> std::sync::Arc<[u8]> {
+    SHADER_INTERN.lock().unwrap().get_or_insert_with(ShaderInterner::default).intern(bytes)
+}
+
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
-pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+pub(crate) fn shaders_key<B: AsRef<[u8]>>(blobs: &[B]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
+}
+
+#[cfg(test)]
+mod shader_intern_tests {
+    use super::ShaderInterner;
+    use std::sync::Arc;
+
+    #[test]
+    fn equal_bytes_share_one_copy_and_distinct_bytes_of_one_length_do_not() {
+        let mut i = ShaderInterner::default();
+        let (a, b) = (vec![1u8, 2, 3, 4], vec![1u8, 2, 3, 5]);
+        let (x, y, z) = (i.intern(&a), i.intern(&a.clone()), i.intern(&b));
+        assert!(Arc::ptr_eq(&x, &y));
+        assert!(!Arc::ptr_eq(&x, &z));
+        assert_eq!(&*x, a.as_slice());
+        assert_eq!(&*z, b.as_slice());
+        assert_ne!(x.as_ptr(), a.as_ptr(), "a copy, not the caller's memory");
+    }
+
+    #[test]
+    fn a_colliding_bucket_still_tells_the_blobs_apart() {
+        // two blobs of one hash and length (forced): only byte equality shares
+        let mut i = ShaderInterner::default();
+        let (a, b) = (vec![9u8; 8], vec![8u8; 8]);
+        let key = (1u64, 8usize);
+        let (x, z) = (i.intern_in(key, &a), i.intern_in(key, &b));
+        assert!(!Arc::ptr_eq(&x, &z));
+        assert_eq!(&*x, a.as_slice());
+        assert_eq!(&*z, b.as_slice());
+        assert!(Arc::ptr_eq(&i.intern_in(key, &a), &x));
+        assert!(Arc::ptr_eq(&i.intern_in(key, &b), &z));
+        assert_eq!(i.map[&key].len(), 2);
+    }
+
+    #[test]
+    fn dead_entries_are_cleaned_once_every_handle_is_dropped() {
+        let mut i = ShaderInterner::default();
+        let a = vec![7u8; 16];
+        let (x, y) = (i.intern(&a), i.intern(&a));
+        assert_eq!(i.map.len(), 1);
+        drop(x);
+        assert!(Arc::ptr_eq(&i.intern(&a), &y), "one live handle keeps the entry");
+        drop(y);
+        i.sweep();
+        assert_eq!(i.map.len(), 0, "no handle left: no entry");
+        // a dead entry is replaced by a fresh copy and its bucket pruned on the next insert
+        let again = i.intern(&a);
+        assert_eq!(i.map.len(), 1);
+        assert_eq!(i.map[&(crate::gpu::shader::fnv64(&a), a.len())].len(), 1);
+        drop(again);
+        let b = i.intern(&[1u8, 2]);
+        drop(b);
+        let c = i.intern(&a);
+        assert_eq!(i.map[&(crate::gpu::shader::fnv64(&a), a.len())].len(), 1, "dead weak pruned when the bucket is touched");
+        drop(c);
+    }
+
+    #[test]
+    fn the_global_interner_shares_copies_between_pipelines() {
+        let bytes = [0xA5u8; 33];
+        let (x, y) = (super::intern_shader(&bytes), super::intern_shader(&bytes));
+        assert!(Arc::ptr_eq(&x, &y));
+    }
 }
 
 #[cfg(test)]
@@ -5423,7 +5689,9 @@ mod shaders_key_tests {
         assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
         assert_ne!(key, super::shaders_key(&[a.clone()]));
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
-        assert_ne!(super::shaders_key(&[]), 0);
+        assert_ne!(super::shaders_key::<Vec<u8>>(&[]), 0);
+        let shared: [std::sync::Arc<[u8]>; 2] = [std::sync::Arc::from(&[1u8, 2, 3][..]), std::sync::Arc::from(&[4u8, 5][..])];
+        assert_eq!(key, super::shaders_key(&shared), "an interned blob keys like its bytes");
     }
 }
 
@@ -5445,10 +5713,10 @@ impl OwnedDesc {
     }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+/// Intern a shader blob into `blobs` and point `b` at the shared copy.
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<std::sync::Arc<[u8]>>) {
     if let Some(bytes) = shader_bytes(b) {
-        blobs.push(bytes.to_vec());
+        blobs.push(intern_shader(bytes));
         let v = blobs.last().unwrap();
         *b = bytecode(v);
     } else {
@@ -5501,7 +5769,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut blobs: Vec<std::sync::Arc<[u8]>> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -5518,7 +5786,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                 if p == 0 || n == 0 {
                     buf[at..at + 16].fill(0);
                 } else if crate::gpu::shader::readable(p, n) {
-                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
+                    blobs.push(intern_shader(std::slice::from_raw_parts(p as *const u8, n)));
                     buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
                 } else {
                     return None;
@@ -6115,7 +6383,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if let Some(key) = gkey {
         if greused {
             if let Some(blob) = gcached.filter(|_| gfrom_disk) {
-                remember_graphics_blob(key, blob);
+                remember_graphics_blob(key, blob, true);
                 driver_cache::note(true, None);
             }
         } else {
@@ -6123,10 +6391,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             if slow || mesh_bytes >= COMPUTE_BLOB_MIN_DXIL {
                 let blob = graphics_blob(key).or_else(|| read_pso_cached_blob(mesh_pso.as_raw()).map(std::sync::Arc::new));
                 if let Some(blob) = blob {
-                    if let Some(path) = gdisk.as_deref().filter(|_| slow) {
-                        driver_cache::keep(path, &blob, gin_driver);
-                    }
-                    remember_graphics_blob(key, blob);
+                    let persisted = gdisk.as_deref().filter(|_| slow).is_some_and(|path| driver_cache::keep(path, &blob, gin_driver));
+                    remember_graphics_blob(key, blob, persisted);
                 }
             }
         }
@@ -6170,10 +6436,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
-            driver_cache::keep(p, &b, cin_driver);
-        }
+        keep_compute_blob(ckey, compute, tp.cs.len(), cdisk.as_deref().map(|p| (p, cin_driver)));
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);
     }
@@ -8518,7 +8781,7 @@ mod mesh_stream_tests {
             let owned = own_stream(d_valid.as_ptr() as *const c_void).expect("valid stream");
             let OwnedDesc::Stream(_, buf, blobs) = owned else { panic!("expected Stream") };
             assert_eq!(blobs.len(), 1);
-            assert_eq!(blobs[0], shader);
+            assert_eq!(&*blobs[0], shader.as_slice());
             let rebased = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
             assert_eq!(rebased, blobs[0].as_ptr() as usize);
             assert_ne!(rebased, shader.as_ptr() as usize);
