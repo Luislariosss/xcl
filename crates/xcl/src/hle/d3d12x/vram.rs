@@ -780,7 +780,7 @@ impl CommitPressureState {
 
 /// True when Windows available virtual commit (`ullAvailPageFile`) is under reserve pressure
 /// (enters below `XCL_COMMIT_RESERVE_MB`, exits once headroom recovers by up to 2 GiB).
-pub(super) fn commit_low() -> bool {
+pub(crate) fn commit_low() -> bool {
     let enter = commit_reserve_bytes();
     if enter == 0 {
         return false;

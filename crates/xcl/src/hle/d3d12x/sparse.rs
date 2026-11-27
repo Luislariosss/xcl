@@ -153,6 +153,17 @@ fn cpu_park_base_secs() -> u64 {
     })
 }
 
+/// Idle duration before releasing the 64 MiB upload ring / 16 MiB readback staging buffers.
+const IDLE_BUF_RELEASE_MS: u64 = 10_000;
+const IDLE_BUF_RELEASE_LOW_MS: u64 = 2_000;
+static LAST_STAGING_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_READBACK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn monotonic_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 fn cpu_park_batch_tiles() -> usize {
     static BATCH: OnceLock<usize> = OnceLock::new();
     *BATCH.get_or_init(|| {
@@ -1096,6 +1107,7 @@ impl State {
     }
 
     unsafe fn staging_ptr(&mut self) -> Option<*mut u8> {
+        LAST_STAGING_MS.store(monotonic_ms(), Ordering::Relaxed);
         if self.staging.is_none() {
             let mut r: Option<ID3D12Resource> = None;
             let mut d = buffer_desc(STAGING as u64);
@@ -1150,6 +1162,7 @@ impl State {
     }
 
     unsafe fn readback_buf(&mut self) -> Option<(ID3D12Resource, *mut u8)> {
+        LAST_READBACK_MS.store(monotonic_ms(), Ordering::Relaxed);
         if self.readback.is_none() {
             let mut r: Option<ID3D12Resource> = None;
             let mut d = buffer_desc(READBACK_STAGING as u64);
@@ -1581,6 +1594,41 @@ impl State {
         let idle_secs = if low { (self.park_idle_secs / 2).max(3) } else { self.park_idle_secs };
         let batch = if low { cpu_park_batch_tiles().saturating_mul(2) } else { cpu_park_batch_tiles() };
         self.sweep_cpu_park_now(std::time::Duration::from_secs(idle_secs), batch);
+        self.trim_idle_buffers(low);
+    }
+
+    /// Release idle sparse upload (64 MiB) and readback (16 MiB) staging buffers once their GPU
+    /// fences have completed and they have been untouched for `IDLE_BUF_RELEASE_MS` (or
+    /// `IDLE_BUF_RELEASE_LOW_MS` under low Windows commit headroom).
+    unsafe fn trim_idle_buffers(&mut self, low: bool) {
+        let now_ms = monotonic_ms();
+        let idle_ms = if low { IDLE_BUF_RELEASE_LOW_MS } else { IDLE_BUF_RELEASE_MS };
+        if self.staging.is_some()
+            && self.fence.GetCompletedValue() >= self.value
+            && now_ms.saturating_sub(LAST_STAGING_MS.load(Ordering::Relaxed)) >= idle_ms
+        {
+            self.inflight.clear();
+            self.ring_write = 0;
+            self.ring_submitted = 0;
+            self.ring_free = 0;
+            self.staging = None;
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 2 || n.is_power_of_two() {
+                crate::xlog_info!("sparse windows: released idle {} MiB upload staging buffer", STAGING >> 20);
+            }
+        }
+        if self.readback.is_some()
+            && self.rb_fence.GetCompletedValue() >= self.rb_last_fence
+            && now_ms.saturating_sub(LAST_READBACK_MS.load(Ordering::Relaxed)) >= idle_ms
+        {
+            self.readback = None;
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 2 || n.is_power_of_two() {
+                crate::xlog_info!("sparse windows: released idle {} MiB readback staging buffer", READBACK_STAGING >> 20);
+            }
+        }
     }
 }
 

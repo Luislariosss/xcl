@@ -1055,9 +1055,10 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
 unsafe fn move_home_away(away: &mut Away, home: usize) -> bool {
     if lazy_home(home) {
         away.gone.push(home);
-        // (256 MB at a time: a call that maps gigabytes would otherwise hold them twice until
-        // it ends)
-        if away.gone.len() >= 4096 {
+        // (256 MB at a time, or 64 MB under low Windows commit headroom: a call that maps
+        // gigabytes would otherwise hold them twice until it ends)
+        let threshold = if crate::hle::d3d12x::vram::commit_low() { 1024 } else { 4096 };
+        if away.gone.len() >= threshold {
             give_back_homes(away);
             return true;
         }
