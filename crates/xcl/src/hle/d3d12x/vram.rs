@@ -509,8 +509,26 @@ impl TilePool {
     }
 }
 
+/// Cooldown after a failed 64 MiB pool heap allocation (`E_OUTOFMEMORY`) so repeated tile
+/// requests do not hammer D3D12 while memory is being reclaimed.
+const POOL_GROW_BACKOFF_MS: u64 = 500;
+static POOL_GROW_BACKOFF_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+fn backoff_active(now_ms: u64, until_ms: u64) -> bool {
+    until_ms != 0 && now_ms < until_ms
+}
+
 /// Allocate one 64 MiB default heap for `Pages`.
 unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+    let now_ms = monotonic_ms();
+    if backoff_active(now_ms, POOL_GROW_BACKOFF_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)) {
+        return None;
+    }
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
         Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -520,7 +538,8 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     };
     let mut heap: Option<ID3D12Heap> = None;
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
-        crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
+        POOL_GROW_BACKOFF_UNTIL_MS.store(now_ms.saturating_add(POOL_GROW_BACKOFF_MS), std::sync::atomic::Ordering::Relaxed);
+        crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e}); backing off {} ms", POOL_GROW_BACKOFF_MS);
         return None;
     }
     heap
@@ -604,13 +623,59 @@ fn avail_commit_bytes() -> Option<u64> {
     (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
 }
 
-fn commit_below_floor(avail_bytes: Option<u64>, floor_bytes: u64) -> bool {
-    floor_bytes > 0 && avail_bytes.is_some_and(|avail| avail < floor_bytes)
+/// Maximum hysteresis deadband above `commit_reserve_bytes()` (2 GiB) before leaving low-commit
+/// mode, preventing reclaim/trim thrashing right at the reserve floor.
+const COMMIT_HYSTERESIS_MAX_BYTES: u64 = 2 << 30;
+/// Minimum interval between `GlobalMemoryStatusEx` polls in `commit_low()`.
+const COMMIT_POLL_INTERVAL_MS: u64 = 250;
+
+fn commit_exit_bytes(enter_bytes: u64) -> u64 {
+    if enter_bytes == 0 {
+        return 0;
+    }
+    enter_bytes.saturating_add((enter_bytes / 2).min(COMMIT_HYSTERESIS_MAX_BYTES))
 }
 
-/// True when Windows available virtual commit (`ullAvailPageFile`) is below the reserve floor.
+#[derive(Default)]
+struct CommitPressureState {
+    low: bool,
+}
+
+impl CommitPressureState {
+    fn update(&mut self, avail_bytes: Option<u64>, enter_bytes: u64, exit_bytes: u64) -> bool {
+        if enter_bytes == 0 {
+            self.low = false;
+            return false;
+        }
+        if let Some(avail) = avail_bytes {
+            if self.low {
+                if avail >= exit_bytes {
+                    self.low = false;
+                }
+            } else if avail < enter_bytes {
+                self.low = true;
+            }
+        }
+        self.low
+    }
+}
+
+/// True when Windows available virtual commit (`ullAvailPageFile`) is under reserve pressure
+/// (enters below `XCL_COMMIT_RESERVE_MB`, exits once headroom recovers by up to 2 GiB).
 pub(super) fn commit_low() -> bool {
-    commit_below_floor(avail_commit_bytes(), commit_reserve_bytes())
+    let enter = commit_reserve_bytes();
+    if enter == 0 {
+        return false;
+    }
+    static STATE: std::sync::Mutex<(Option<u64>, CommitPressureState)> =
+        std::sync::Mutex::new((None, CommitPressureState { low: false }));
+    let now = monotonic_ms();
+    let mut guard = STATE.lock().unwrap();
+    if guard.0.is_none_or(|last| now.saturating_sub(last) >= COMMIT_POLL_INTERVAL_MS) {
+        guard.0 = Some(now);
+        guard.1.update(avail_commit_bytes(), enter, commit_exit_bytes(enter));
+    }
+    guard.1.low
 }
 
 /// The title's pages of video memory for tiled textures (see the module's comment).
@@ -2255,12 +2320,31 @@ mod tests {
     }
 
     #[test]
-    fn commit_below_floor_enforces_reserve_and_zero_disables() {
-        const FLOOR: u64 = 4 * 1024 * 1024 * 1024;
-        assert!(commit_below_floor(Some(FLOOR - 1), FLOOR));
-        assert!(!commit_below_floor(Some(FLOOR), FLOOR));
-        assert!(!commit_below_floor(Some(FLOOR + 1), FLOOR));
-        assert!(!commit_below_floor(None, FLOOR));
-        assert!(!commit_below_floor(Some(0), 0));
+    fn commit_pressure_hysteresis_and_zero_disable() {
+        const ENTER: u64 = 4 << 30;
+        let exit = commit_exit_bytes(ENTER);
+        assert_eq!(exit, 6 << 30);
+
+        let mut st = CommitPressureState::default();
+        assert!(!st.update(Some(ENTER), ENTER, exit));
+        assert!(st.update(Some(ENTER - 1), ENTER, exit));
+        // stays low inside the deadband [4 GiB, 6 GiB)
+        assert!(st.update(Some(ENTER), ENTER, exit));
+        assert!(st.update(Some(exit - 1), ENTER, exit));
+        // leaves low-commit once headroom recovers to >= 6 GiB
+        assert!(!st.update(Some(exit), ENTER, exit));
+        // stays normal inside the deadband until dropping below 4 GiB again
+        assert!(!st.update(Some(ENTER), ENTER, exit));
+        // zero floor disables pressure
+        assert!(st.update(Some(ENTER - 1), ENTER, exit));
+        assert!(!st.update(Some(0), 0, 0));
+    }
+
+    #[test]
+    fn pool_grow_backoff_window() {
+        assert!(!backoff_active(100, 0));
+        assert!(backoff_active(100, 600));
+        assert!(!backoff_active(600, 600));
+        assert!(!backoff_active(700, 600));
     }
 }

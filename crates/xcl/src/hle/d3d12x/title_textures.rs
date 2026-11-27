@@ -1096,6 +1096,45 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
     batch_fits_limit(picked_count, picked_bytes, batch_dev, next_dev, next_bytes, BATCH_BYTES)
 }
 
+/// Cooldown after an `E_OUTOFMEMORY` during texture upload so failing allocations do not cascade
+/// while D3D12 / staging buffers are reclaimed.
+const UPLOAD_OOM_BACKOFF_MS: u64 = 500;
+static UPLOAD_OOM_BACKOFF_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+fn backoff_active(now_ms: u64, until_ms: u64) -> bool {
+    until_ms != 0 && now_ms < until_ms
+}
+
+fn is_oom_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("0x8007000e")
+        || lower.contains("e_outofmemory")
+        || lower.contains("out of memory")
+        || lower.contains("ran out of memory")
+}
+
+/// Re-mark deferred textures as pending so they upload on a later submit once memory recovers.
+fn requeue_pending(resources: impl IntoIterator<Item = usize>) {
+    let mut t = TEXTURES.lock().unwrap();
+    let mut added = 0usize;
+    for res in resources {
+        if let Some(e) = t.by_res.get_mut(&res) {
+            if !e.gpu_written && !e.pending {
+                e.pending = true;
+                added += 1;
+            }
+        }
+    }
+    if added > 0 {
+        PENDING.fetch_add(added, Ordering::Relaxed);
+    }
+}
+
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (or `BATCH_BYTES_LOW_COMMIT` when Windows
 /// commit is below reserve) and `BATCH_ITEMS` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
@@ -1105,6 +1144,10 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             crate::xlog_warn!("title texture: upload failed: {e}");
         }
     };
+    if backoff_active(monotonic_ms(), UPLOAD_OOM_BACKOFF_UNTIL_MS.load(Ordering::Relaxed)) {
+        requeue_pending(todo.into_iter().map(|(r, _)| r.as_raw() as usize));
+        return;
+    }
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
         let mut picked = Vec::new();
@@ -1155,6 +1198,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             Ok(q) => q,
             Err(e) => {
                 warn(&e);
+                if is_oom_error(&e) {
+                    UPLOAD_OOM_BACKOFF_UNTIL_MS.store(monotonic_ms().saturating_add(UPLOAD_OOM_BACKOFF_MS), Ordering::Relaxed);
+                    texture::trim_idle_staging(super::present::presents(), true);
+                    requeue_pending(batch.into_iter().map(|(r, _, _)| r.as_raw() as usize).chain(todo.map(|(r, _)| r.as_raw() as usize)));
+                    break;
+                }
                 continue;
             }
         };
@@ -1168,7 +1217,15 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 }
                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                warn(&e);
+                if is_oom_error(&e) {
+                    UPLOAD_OOM_BACKOFF_UNTIL_MS.store(monotonic_ms().saturating_add(UPLOAD_OOM_BACKOFF_MS), Ordering::Relaxed);
+                    texture::trim_idle_staging(super::present::presents(), true);
+                    requeue_pending(batch.into_iter().map(|(r, _, _)| r.as_raw() as usize).chain(todo.map(|(r, _)| r.as_raw() as usize)));
+                    break;
+                }
+            }
         }
     }
 }
@@ -2726,5 +2783,15 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    #[test]
+    fn oom_detection_and_backoff_window() {
+        assert!(is_oom_error("CreateCommittedResource: Ran out of memory (0x8007000E)"));
+        assert!(is_oom_error("E_OUTOFMEMORY"));
+        assert!(!is_oom_error("DXGI_ERROR_DEVICE_REMOVED (0x887A0005)"));
+        assert!(!backoff_active(50, 0));
+        assert!(backoff_active(50, 550));
+        assert!(!backoff_active(550, 550));
     }
 }
