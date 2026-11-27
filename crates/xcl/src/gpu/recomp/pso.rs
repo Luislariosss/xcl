@@ -147,7 +147,13 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 /// Global in-memory cache for translated shaders shared by `console_to_dxil_in` and `console_mesh`.
 fn shader_cache() -> &'static Mutex<ShaderCache> {
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)))
+    CACHE.get_or_init(|| {
+        let mb = std::env::var("XCL_SHADER_CACHE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(16);
+        Mutex::new(ShaderCache::new(mb.saturating_mul(1 << 20)))
+    })
 }
 
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`

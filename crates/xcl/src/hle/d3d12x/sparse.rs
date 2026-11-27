@@ -41,7 +41,7 @@ const POOL_TILES: u32 = 1024;
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
 /// bytes of the ring-buffered upload staging buffer
-const STAGING: usize = 64 << 20;
+const STAGING: usize = 16 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
 const RING_ALIGN: usize = 64;
 /// number of in-flight upload command allocators / lists
@@ -49,7 +49,7 @@ const UPLOAD_SLOTS: usize = 16;
 /// bytes of the dedicated pre-zeroed buffer for tile/hole clears (1 MiB)
 const ZERO_BUF: usize = 1 << 20;
 /// bytes of the GPU→CPU readback staging buffer
-const READBACK_STAGING: usize = 16 << 20;
+const READBACK_STAGING: usize = 4 << 20;
 
 const PAGE: usize = 0x1000;
 const PAGES_PER_TILE: usize = TILE / PAGE;
