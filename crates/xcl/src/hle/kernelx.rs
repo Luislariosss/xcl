@@ -343,18 +343,6 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
-            // When the coherent window is full or capped (`XCL_COHERENT_CAP_MB`), spill into the
-            // sparse VRAM windows so shaders still see the data and `sparse::cpu_park` can
-            // decommit idle CPU pages to save host RAM (`XCL_COHERENT_SPILL_SPARSE=0`: off).
-            static SPILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let spill = *SPILL.get_or_init(|| std::env::var("XCL_COHERENT_SPILL_SPARSE").map_or(true, |v| v.trim() != "0"));
-            if spill {
-                let rounded = size.max(1).div_ceil(align) * align;
-                if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
-                    trace_mem("VirtualAlloc (graphics, coherent->sparse spill)", 0, rounded, t as u64, p, q);
-                    return q as *mut c_void;
-                }
-            }
         }
     }
     // GPU-visible title memory the windows above had no room for (a retail game: a 24 GB
