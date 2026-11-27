@@ -345,6 +345,8 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             }
         }
     }
+    let sanitized_prot = sanitize_protect(p);
+    let lazy_eligible = lazy_commit_enabled() && eligible_for_lazy_commit(size, t, sanitized_prot);
     // GPU-visible title memory the windows above had no room for (a retail game: a 24 GB
     // reservation of 64 KiB pages, 2.2 GB of large pages with a graphics protection) is plain
     // memory here. Textures the title places in it are kept in step with it
@@ -352,16 +354,66 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // like a graphics reservation. Without that such a texture was uploaded once, empty, and
     // never again (the game's glyph atlas: its menus lost their x-height letters).
     if gpu_visible_fallback(addr, t, p) {
-        let q = reserve_watched(size, t, p);
+        let alloc_t = if lazy_eligible { t & !mem::MEM_COMMIT } else { t };
+        let q = reserve_watched(size, alloc_t, p);
         if !q.is_null() {
+            if lazy_eligible {
+                lazy::mark_range(q as usize, size);
+            }
             mirrors::reserved(q as usize, size, t, p);
-            trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
+            trace_mem(
+                if lazy_eligible { "VirtualAlloc (GPU-visible, lazy commit)" } else { "VirtualAlloc (GPU-visible, write-watched)" },
+                addr as usize,
+                size,
+                t as u64,
+                p,
+                q as usize,
+            );
             return q;
         }
     }
-    let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
+    if lazy_eligible {
+        if addr.is_null() && t & mem::MEM_RESERVE != 0 {
+            let q = mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t & !mem::MEM_COMMIT), sanitized_prot);
+            if !q.is_null() {
+                lazy::mark_range(q as usize, size);
+                trace_mem("VirtualAlloc (lazy reserve+commit)", 0, size, t as u64, p, q as usize);
+                return q;
+            }
+        } else if !addr.is_null()
+            && t & mem::MEM_RESERVE == 0
+            && (addr as usize).is_multiple_of(PHYS_PAGE)
+            && size.is_multiple_of(PHYS_PAGE)
+        {
+            let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            if mem::VirtualQuery(addr, &mut m, std::mem::size_of_val(&m)) != 0
+                && m.State == mem::MEM_RESERVE
+                && m.RegionSize >= size
+            {
+                lazy::mark_range(addr as usize, size);
+                trace_mem("VirtualAlloc (lazy commit)", addr as usize, size, t as u64, p, addr as usize);
+                return addr as *mut c_void;
+            }
+        }
+    }
+    let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitized_prot);
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
+}
+
+/// Minimum size (4 MiB) for demand-committing plain `VirtualAlloc(..., MEM_COMMIT, ...)` blocks
+/// via `lazy::mark_range` (`XCL_LAZY_COMMIT=0` disables).
+const LAZY_COMMIT_MIN_BYTES: usize = 4 << 20;
+
+fn lazy_commit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !cfg!(test) && std::env::var("XCL_LAZY_COMMIT").map_or(true, |v| v.trim() != "0"))
+}
+
+fn eligible_for_lazy_commit(size: usize, alloc_type: u32, sanitized_prot: u32) -> bool {
+    size >= LAZY_COMMIT_MIN_BYTES
+        && alloc_type & mem::MEM_COMMIT != 0
+        && (sanitized_prot == mem::PAGE_READWRITE || sanitized_prot == (mem::PAGE_READWRITE | mem::PAGE_WRITECOMBINE))
 }
 
 /// Whether a VirtualAlloc that reached the plain-memory fallback is GPU-visible title memory
@@ -469,10 +521,33 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
+    let release_span = if t & mem::MEM_RELEASE != 0 && !addr.is_null() {
+        let mut span = 0usize;
+        let mut cur = addr as usize;
+        let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        while mem::VirtualQuery(cur as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
+            && m.AllocationBase == addr
+            && m.RegionSize > 0
+        {
+            span = span.saturating_add(m.RegionSize);
+            match cur.checked_add(m.RegionSize) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        span
+    } else {
+        size
+    };
     let ok = mem::VirtualFree(addr, size, t);
-    if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
-        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
-        mirrors::released(addr as usize);
+    if ok != 0 {
+        if release_span > 0 {
+            lazy::unmark_range(addr as usize, release_span);
+        }
+        if t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::released(addr as usize);
+        }
     }
     ok
 }
@@ -494,13 +569,13 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    crate::hle::d3d12x::sparse::ensure_cpu_resident(addr as usize, size);
+    lazy::ensure(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
     if is_current_process(proc_) {
-        crate::hle::d3d12x::sparse::ensure_cpu_resident(addr as usize, size);
+        lazy::ensure(addr as usize, size);
     }
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
 }
@@ -711,7 +786,12 @@ pub unsafe extern "system" fn VirtualQuery(address: *const c_void, mbi: *mut mem
         return n;
     }
     crate::hle::d3d12x::sparse::ensure_cpu_resident(address as usize, 1);
-    mem::VirtualQuery(address, mbi, len)
+    let n = mem::VirtualQuery(address, mbi, len);
+    if n >= std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>() && (*mbi).State == mem::MEM_RESERVE && lazy::is_marked(address as usize) {
+        (*mbi).State = mem::MEM_COMMIT;
+        (*mbi).Protect = mem::PAGE_READWRITE;
+    }
+    n
 }
 
 pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
@@ -721,7 +801,16 @@ pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_
         }
         crate::hle::d3d12x::sparse::ensure_cpu_resident(address as usize, 1);
     }
-    mem::VirtualQueryEx(process, address, mbi, len)
+    let n = mem::VirtualQueryEx(process, address, mbi, len);
+    if is_current_process(process)
+        && n >= std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()
+        && (*mbi).State == mem::MEM_RESERVE
+        && lazy::is_marked(address as usize)
+    {
+        (*mbi).State = mem::MEM_COMMIT;
+        (*mbi).Protect = mem::PAGE_READWRITE;
+    }
+    n
 }
 
 /// The field at +48 of `XMEM_BASIC_INFORMATION` is 16 bytes; callers inspect more than its low

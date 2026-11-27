@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Once, RwLock};
 
 use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
@@ -27,6 +28,8 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
 /// pages (64 KiB) mapped but not committed yet
 static LAZY: RwLock<BTreeSet<usize>> = RwLock::new(BTreeSet::new());
+/// Fast-path count of `LAZY` (avoids taking the lock when no lazy pages exist).
+static LAZY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn install() {
     static ONCE: Once = Once::new();
@@ -41,7 +44,9 @@ unsafe fn commit(page: usize) -> bool {
     if !g.remove(&page) {
         return false;
     }
-    !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    let ok = !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null();
+    LAZY_COUNT.store(g.len(), Ordering::Release);
+    ok
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -75,12 +80,67 @@ unsafe fn allows(access: usize, at: usize) -> bool {
 /// `page` (reserved, 64 KiB aligned) is mapped: committed on first use.
 pub(crate) fn mark(page: usize) {
     install();
-    LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(page);
+    let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    if g.insert(page) {
+        LAZY_COUNT.store(g.len(), Ordering::Release);
+    }
+}
+
+/// Mark every 64 KiB page in `[start, start + len)` for demand-commit on first touch.
+pub(crate) fn mark_range(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    install();
+    let first = start & !(PAGE - 1);
+    let end = start.saturating_add(len).div_ceil(PAGE).saturating_mul(PAGE);
+    let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    let mut p = first;
+    while p < end {
+        g.insert(p);
+        match p.checked_add(PAGE) {
+            Some(next) => p = next,
+            None => break,
+        }
+    }
+    LAZY_COUNT.store(g.len(), Ordering::Release);
 }
 
 /// `page` is unmapped: true if it was never used (nothing to keep of it).
 pub(super) fn unmark(page: usize) -> bool {
-    LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
+    if LAZY_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    let removed = g.remove(&page);
+    if removed {
+        LAZY_COUNT.store(g.len(), Ordering::Release);
+    }
+    removed
+}
+
+/// Unmark every 64 KiB lazy page overlapping `[start, start + len)`.
+pub(crate) fn unmark_range(start: usize, len: usize) {
+    if len == 0 || LAZY_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let first = start & !(PAGE - 1);
+    let end = start.saturating_add(len);
+    let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    let to_remove: Vec<usize> = g.range(first..end).copied().collect();
+    for p in to_remove {
+        g.remove(&p);
+    }
+    LAZY_COUNT.store(g.len(), Ordering::Release);
+}
+
+/// True if `addr` falls inside a demand-commit lazy page.
+pub(crate) fn is_marked(addr: usize) -> bool {
+    if LAZY_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let page = addr & !(PAGE - 1);
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
 }
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
@@ -90,6 +150,9 @@ pub fn ensure(p: usize, len: usize) {
         return;
     }
     unsafe { crate::hle::d3d12x::sparse::ensure_cpu_resident(p, len) };
+    if LAZY_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
@@ -155,6 +218,25 @@ mod tests {
                     assert_eq!(std::ptr::read_volatile((r + i * PAGE + t * 64) as *const u64), (i * THREADS + t) as u64);
                 }
             }
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn mark_range_and_unmark_range_track_64k_pages() {
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            mark_range(r, 4 * PAGE);
+            assert!(is_marked(r));
+            assert!(is_marked(r + 3 * PAGE + 123));
+            unmark_range(r + PAGE, 2 * PAGE);
+            assert!(is_marked(r));
+            assert!(!is_marked(r + PAGE));
+            assert!(!is_marked(r + 2 * PAGE));
+            assert!(is_marked(r + 3 * PAGE));
+            unmark_range(r, 4 * PAGE);
+            assert!(!is_marked(r));
+            assert!(!is_marked(r + 3 * PAGE));
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
         }
     }
